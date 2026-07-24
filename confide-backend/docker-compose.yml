@@ -1,0 +1,90 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: confide
+      POSTGRES_PASSWORD: confide
+      POSTGRES_DB: confide
+    ports:
+      - "5432:5432"
+    volumes:
+      - confide_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U confide"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot migration runner — applies the Prisma schema then exits.
+  # `docker compose up` will run this before backend/worker are considered
+  # healthy-dependent, but it's still worth running `docker compose run
+  # migrate` manually after changing prisma/schema.prisma.
+  migrate:
+    build: .
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://confide:confide@postgres:5432/confide
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://confide:confide@postgres:5432/confide
+      REDIS_URL: redis://redis:6379
+      PORT: 3000
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      MODERATION_PROVIDER: ${MODERATION_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      MODERATION_TIMEOUT_MS: ${MODERATION_TIMEOUT_MS:-2500}
+      MATCH_REQUEST_TTL_SECONDS: ${MATCH_REQUEST_TTL_SECONDS:-120}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PRICE_SILVER: ${STRIPE_PRICE_SILVER:-}
+      STRIPE_PRICE_GOLD: ${STRIPE_PRICE_GOLD:-}
+      STRIPE_PRICE_DIAMOND: ${STRIPE_PRICE_DIAMOND:-}
+      STRIPE_PRICE_PLATINUM: ${STRIPE_PRICE_PLATINUM:-}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-dev-admin-token-change-me}
+      EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN:-}
+      ESCALATION_ENCRYPTION_KEY: ${ESCALATION_ENCRYPTION_KEY}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: .
+    command: ["node", "dist/workers/matching.worker.js"]
+    environment:
+      DATABASE_URL: postgresql://confide:confide@postgres:5432/confide
+      REDIS_URL: redis://redis:6379
+      SENTRY_DSN: ${SENTRY_DSN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  confide_postgres_data:
