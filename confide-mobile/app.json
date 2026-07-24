@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Confide",
+    "slug": "confide",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
+    "assetBundlePatterns": ["**/*"],
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Confide uses your approximate location to find nearby conversation partners when you choose a distance preference."
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash.png",
+          "backgroundColor": "#151220",
+          "resizeMode": "contain"
+        }
+      ]
+    ],
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.confide.app" },
+    "android": {
+      "package": "com.confide.app",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#151220"
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    }
+  }
+}

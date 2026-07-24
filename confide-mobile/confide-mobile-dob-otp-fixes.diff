@@ -1,0 +1,255 @@
+diff --git a/src/screens/SignupScreen.tsx b/src/screens/SignupScreen.tsx
+index 910a49f..df526da 100644
+--- a/src/screens/SignupScreen.tsx
++++ b/src/screens/SignupScreen.tsx
+@@ -1,5 +1,5 @@
+ import React, { useState } from "react";
+-import { View, Text, TextInput, Pressable, StyleSheet, Alert } from "react-native";
++import { View, Text, TextInput, Pressable, StyleSheet, Alert, KeyboardAvoidingView, ScrollView, Platform } from "react-native";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+ import type { RootStackParamList } from "@/navigation/RootNavigator";
+ import { api, ApiError } from "@/api/client";
+@@ -9,21 +9,51 @@ type Props = NativeStackScreenProps<RootStackParamList, "Signup">;
+ // Section 9.2's noted limitation applies here too: this DOB field is
+ // self-attested, not verified against an ID. The backend enforces the 18+
+ // floor server-side regardless of what this form allows through.
++//
++// DOB is collected as separate day/month/year fields rather than one
++// free-text field. A single field that claims to accept "any format" is
++// genuinely ambiguous — "03-04-1990" means a different date depending on
++// whether it's read as dd-mm-yyyy or mm-dd-yyyy — and silently guessing
++// wrong on an 18+ gate has real consequences. Separate fields sidestep the
++// ambiguity instead of trying to resolve it.
++function toIsoDate(day: string, month: string, year: string): string | null {
++  const d = Number(day);
++  const m = Number(month);
++  const y = Number(year);
++  if (!day || !month || !year) return null;
++  if (!Number.isInteger(d) || !Number.isInteger(m) || !Number.isInteger(y)) return null;
++  if (m < 1 || m > 12 || d < 1 || d > 31 || y < 1900 || y > new Date().getFullYear()) return null;
++
++  // Reject impossible dates (e.g. Feb 30) rather than silently normalizing
++  // them to a nearby real date, since JS Date's rollover behavior would
++  // otherwise turn a typo into a different, wrong date of birth.
++  const date = new Date(Date.UTC(y, m - 1, d));
++  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== m - 1 || date.getUTCDate() !== d) {
++    return null;
++  }
++
++  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
++}
++
+ export default function SignupScreen({ navigation }: Props) {
+   const [displayHandle, setDisplayHandle] = useState("");
+-  const [dob, setDob] = useState(""); // YYYY-MM-DD
+-  const [phoneE164, setPhoneE164] = useState("");
++  const [dobDay, setDobDay] = useState("");
++  const [dobMonth, setDobMonth] = useState("");
++  const [dobYear, setDobYear] = useState("");
++  const [phoneE164, setPhoneE164] = useState("+91 ");
+   const [submitting, setSubmitting] = useState(false);
+ 
+   const onSubmit = async () => {
+-    if (!displayHandle || !dob || !phoneE164) {
+-      Alert.alert("Missing info", "Please fill in a handle, date of birth, and phone number.");
++    const dob = toIsoDate(dobDay, dobMonth, dobYear);
++    const phone = phoneE164.replace(/[^\d+]/g, ""); // strip spaces before sending
++    if (!displayHandle || !dob || !phone) {
++      Alert.alert("Missing info", "Please fill in a handle, a valid date of birth, and phone number.");
+       return;
+     }
+     setSubmitting(true);
+     try {
+-      await api.signup({ displayHandle, dob, phoneE164 });
+-      navigation.navigate("VerifyOtp", { phoneE164 });
++      await api.signup({ displayHandle, dob, phoneE164: phone });
++      navigation.navigate("VerifyOtp", { phoneE164: phone });
+     } catch (err) {
+       if (err instanceof ApiError && err.body && (err.body as any).error === "must_be_18_or_older") {
+         Alert.alert("Age requirement", "You must be 18 or older to use Confide.");
+@@ -38,46 +68,74 @@ export default function SignupScreen({ navigation }: Props) {
+   };
+ 
+   return (
+-    <View style={styles.container}>
+-      <Text style={styles.title}>Create your anonymous profile</Text>
+-      <Text style={styles.hint}>Your handle is never your real name — pick anything.</Text>
++    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : "height"}>
++      <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
++        <Text style={styles.title}>Create your anonymous profile</Text>
++        <Text style={styles.hint}>Your handle is never your real name — pick anything.</Text>
++
++        <TextInput
++          style={styles.input}
++          placeholder="Display handle"
++          placeholderTextColor="#8a8598"
++          value={displayHandle}
++          onChangeText={setDisplayHandle}
++          autoCapitalize="none"
++        />
++
++        <Text style={styles.label}>Date of birth</Text>
++        <View style={styles.dobRow}>
++          <TextInput
++            style={[styles.input, styles.dobInput]}
++            placeholder="DD"
++            placeholderTextColor="#8a8598"
++            value={dobDay}
++            onChangeText={setDobDay}
++            keyboardType="number-pad"
++            maxLength={2}
++          />
++          <TextInput
++            style={[styles.input, styles.dobInput]}
++            placeholder="MM"
++            placeholderTextColor="#8a8598"
++            value={dobMonth}
++            onChangeText={setDobMonth}
++            keyboardType="number-pad"
++            maxLength={2}
++          />
++          <TextInput
++            style={[styles.input, styles.dobInputYear]}
++            placeholder="YYYY"
++            placeholderTextColor="#8a8598"
++            value={dobYear}
++            onChangeText={setDobYear}
++            keyboardType="number-pad"
++            maxLength={4}
++          />
++        </View>
+ 
+-      <TextInput
+-        style={styles.input}
+-        placeholder="Display handle"
+-        placeholderTextColor="#8a8598"
+-        value={displayHandle}
+-        onChangeText={setDisplayHandle}
+-        autoCapitalize="none"
+-      />
+-      <TextInput
+-        style={styles.input}
+-        placeholder="Date of birth (YYYY-MM-DD)"
+-        placeholderTextColor="#8a8598"
+-        value={dob}
+-        onChangeText={setDob}
+-        keyboardType="numbers-and-punctuation"
+-      />
+-      <TextInput
+-        style={styles.input}
+-        placeholder="Phone number (+1...)"
+-        placeholderTextColor="#8a8598"
+-        value={phoneE164}
+-        onChangeText={setPhoneE164}
+-        keyboardType="phone-pad"
+-      />
++        <TextInput
++          style={styles.input}
++          placeholder="+91 98765 43210"
++          placeholderTextColor="#8a8598"
++          value={phoneE164}
++          onChangeText={setPhoneE164}
++          keyboardType="phone-pad"
++        />
+ 
+-      <Pressable style={styles.button} onPress={onSubmit} disabled={submitting}>
+-        <Text style={styles.buttonText}>{submitting ? "Sending code…" : "Continue"}</Text>
+-      </Pressable>
+-    </View>
++        <Pressable style={styles.button} onPress={onSubmit} disabled={submitting}>
++          <Text style={styles.buttonText}>{submitting ? "Sending code…" : "Continue"}</Text>
++        </Pressable>
++      </ScrollView>
++    </KeyboardAvoidingView>
+   );
+ }
+ 
+ const styles = StyleSheet.create({
+-  container: { flex: 1, backgroundColor: "#151220", padding: 24, justifyContent: "center", gap: 12 },
++  flex: { flex: 1, backgroundColor: "#151220" },
++  container: { flexGrow: 1, padding: 24, justifyContent: "center", gap: 12 },
+   title: { color: "#fff", fontSize: 22, fontWeight: "700" },
+   hint: { color: "#a39cb5", fontSize: 14, marginBottom: 12 },
++  label: { color: "#a39cb5", fontSize: 13, marginTop: 4 },
+   input: {
+     backgroundColor: "#221e33",
+     color: "#fff",
+@@ -86,6 +144,9 @@ const styles = StyleSheet.create({
+     paddingVertical: 12,
+     fontSize: 16,
+   },
++  dobRow: { flexDirection: "row", gap: 8 },
++  dobInput: { flex: 1, textAlign: "center" },
++  dobInputYear: { flex: 1.4, textAlign: "center" },
+   button: {
+     backgroundColor: "#7c5cff",
+     borderRadius: 10,
+diff --git a/src/screens/VerifyOtpScreen.tsx b/src/screens/VerifyOtpScreen.tsx
+index 1e6cda3..aee50e7 100644
+--- a/src/screens/VerifyOtpScreen.tsx
++++ b/src/screens/VerifyOtpScreen.tsx
+@@ -1,5 +1,5 @@
+ import React, { useState } from "react";
+-import { View, Text, TextInput, Pressable, StyleSheet, Alert } from "react-native";
++import { View, Text, TextInput, Pressable, StyleSheet, Alert, KeyboardAvoidingView, ScrollView, Platform } from "react-native";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+ import type { RootStackParamList } from "@/navigation/RootNavigator";
+ import { api } from "@/api/client";
+@@ -30,33 +30,36 @@ export default function VerifyOtpScreen({ route }: Props) {
+   };
+ 
+   return (
+-    <View style={styles.container}>
+-      <Text style={styles.title}>Enter the code we sent to</Text>
+-      <Text style={styles.phone}>{phoneE164}</Text>
+-      <Text style={styles.hint}>
+-        (In this local dev build, the code is logged in the backend server's console —
+-        SMS delivery isn't wired up yet.)
+-      </Text>
++    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : "height"}>
++      <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
++        <Text style={styles.title}>Enter the code we sent to</Text>
++        <Text style={styles.phone}>{phoneE164}</Text>
++        <Text style={styles.hint}>
++          (In this local dev build, the code is logged in the backend server's console —
++          SMS delivery isn't wired up yet.)
++        </Text>
+ 
+-      <TextInput
+-        style={styles.input}
+-        placeholder="123456"
+-        placeholderTextColor="#8a8598"
+-        value={code}
+-        onChangeText={setCode}
+-        keyboardType="number-pad"
+-        maxLength={6}
+-      />
++        <TextInput
++          style={styles.input}
++          placeholder="123456"
++          placeholderTextColor="#8a8598"
++          value={code}
++          onChangeText={setCode}
++          keyboardType="number-pad"
++          maxLength={6}
++        />
+ 
+-      <Pressable style={styles.button} onPress={onSubmit} disabled={submitting}>
+-        <Text style={styles.buttonText}>{submitting ? "Verifying…" : "Verify"}</Text>
+-      </Pressable>
+-    </View>
++        <Pressable style={styles.button} onPress={onSubmit} disabled={submitting}>
++          <Text style={styles.buttonText}>{submitting ? "Verifying…" : "Verify"}</Text>
++        </Pressable>
++      </ScrollView>
++    </KeyboardAvoidingView>
+   );
+ }
+ 
+ const styles = StyleSheet.create({
+-  container: { flex: 1, backgroundColor: "#151220", padding: 24, justifyContent: "center", gap: 12 },
++  flex: { flex: 1, backgroundColor: "#151220" },
++  container: { flexGrow: 1, padding: 24, justifyContent: "center", gap: 12 },
+   title: { color: "#fff", fontSize: 18, fontWeight: "600" },
+   phone: { color: "#fff", fontSize: 20, fontWeight: "700", marginBottom: 4 },
+   hint: { color: "#a39cb5", fontSize: 13, marginBottom: 16 },

@@ -1,0 +1,2199 @@
+diff --git a/confide-backend/README.md b/confide-backend/README.md
+index d188cfa..2d8f607 100644
+--- a/confide-backend/README.md
++++ b/confide-backend/README.md
+@@ -40,6 +40,34 @@ sandbox this was built in** — Docker isn't installed there. The
+ the YAML has been syntax-checked, but the actual build/run hasn't been
+ exercised. Try it and expect to debug at least the first run.
+ 
++## Mandatory subscription gate, free trial, and wellness features (latest addition)
++
++Per product decision: **both** Speaker and Listener roles now require an
++active subscription for real matching — enforced server-side in
++`routes/match.ts` (`hasActiveSubscription`, `lib/subscription.ts`), not just
++assumed client-side. **App Store risk flag, repeating it here since it's
++the actual enforcement point:** a hard paywall with zero free usage on
++both sides of a two-sided marketplace is a real review-rejection risk on
++both app stores. This was an explicit product decision, not a
++recommendation.
++
++- **One-time free trial**: `POST /trial/start` — 10 minutes, SILVER tier
++  only, no topic selection (fixed "general" tag). Marked used at request
++  time (not completion) so cancel-and-retry can't farm multiple trials.
++  Server-side enforced expiry lives in `routes/chat.ts` (a `setTimeout` per
++  active trial connection — **note**: this timer is lost on a server
++  restart mid-trial; acceptable for now, worth a durable-scheduler fix
++  before real scale).
++- **Journal** (`routes/journal.ts`) and **Mood tracker** (`routes/mood.ts`):
++  full CRUD, gated behind the same subscription check. Private per-user
++  data, no moderation pipeline (not shared with anyone).
++- **Meditation** and **breathing exercise**: mobile-only, no backend
++  routes — see the mobile README for what's stubbed there (no real audio).
++- `GET /subscription/status`: convenience endpoint the mobile app polls to
++  decide whether to show Home, the trial/subscribe offer, or nothing new —
++  this is NOT the enforcement point, just a UX convenience. The gated
++  routes check for themselves.
++
+ ## Setup (without Docker)
+ 
+ ```bash
+diff --git a/confide-backend/prisma/schema.prisma b/confide-backend/prisma/schema.prisma
+index 56a0a5d..b9ee8eb 100644
+--- a/confide-backend/prisma/schema.prisma
++++ b/confide-backend/prisma/schema.prisma
+@@ -87,6 +87,12 @@ model User {
+ 
+   expoPushToken     String?  // for match-found / message notifications while backgrounded
+ 
++  // One-time free trial (10-min, SILVER-tier-only conversation) — see
++  // routes/trial.ts. Set the instant a trial MatchRequest is created, not
++  // when it completes, so cancel-and-retry can't be used to get a second
++  // trial.
++  freeTrialUsedAt   DateTime?
++
+   createdAt         DateTime      @default(now())
+   updatedAt         DateTime      @updatedAt
+ 
+@@ -99,6 +105,8 @@ model User {
+   conversationsAsA  Conversation[]    @relation("ConversationParticipantA")
+   conversationsAsB  Conversation[]    @relation("ConversationParticipantB")
+   pointLedgerEntries PointLedgerEntry[]
++  journalEntries    JournalEntry[]
++  moodEntries       MoodEntry[]
+ 
+   @@index([accountStatus])
+ }
+@@ -145,6 +153,13 @@ model MatchRequest {
+   languagePref   String?
+   state          MatchRequestState  @default(QUEUED)
+ 
++  // Free-trial requests are always matched at SILVER tier regardless of the
++  // requester's real subscription tier (they typically have none yet) — see
++  // workers/matching.worker.ts. Real (non-trial) requests can only be
++  // created by a user with an active subscription — enforced in
++  // routes/match.ts, not just assumed here.
++  isTrial        Boolean            @default(false)
++
+   matchedConversationId String?
+ 
+   createdAt      DateTime           @default(now())
+@@ -164,6 +179,12 @@ model Conversation {
+   topicTag       String
+   status         ConversationStatus @default(ACTIVE)
+ 
++  // Free-trial conversations are hard-capped server-side (routes/chat.ts
++  // schedules an auto-close at trialEndsAt) — this is enforcement, not just
++  // a client-side countdown display value.
++  isTrial        Boolean            @default(false)
++  trialEndsAt    DateTime?
++
+   startedAt      DateTime           @default(now())
+   endedAt        DateTime?
+ 
+@@ -286,3 +307,36 @@ model Block {
+ 
+   @@unique([blockerUserId, blockedUserId])
+ }
++
++// Wellness features — gated behind an active subscription (see
++// lib/subscription.ts), same as real matching. Entries are private to the
++// user; nothing here is shared with a match partner or moderated, since
++// it's reflective content, not chat.
++model JournalEntry {
++  id        String   @id @default(cuid())
++  userId    String
++  user      User     @relation(fields: [userId], references: [id])
++
++  content   String
++  mood      String? // free-form tag, e.g. "anxious", "hopeful" — not the same enum as MoodEntry's fixed scale
++
++  createdAt DateTime @default(now())
++  updatedAt DateTime @updatedAt
++
++  @@index([userId, createdAt])
++}
++
++model MoodEntry {
++  id        String   @id @default(cuid())
++  userId    String
++  user      User     @relation(fields: [userId], references: [id])
++
++  // Fixed 1-5 scale rather than free text, so trends can actually be
++  // charted — free-form mood descriptions live on JournalEntry instead.
++  score     Int      // 1 (very low) – 5 (very good)
++  note      String?
++
++  createdAt DateTime @default(now())
++
++  @@index([userId, createdAt])
++}
+diff --git a/confide-backend/src/__tests__/matching-tier.test.ts b/confide-backend/src/__tests__/matching-tier.test.ts
+new file mode 100644
+index 0000000..4e09764
+--- /dev/null
++++ b/confide-backend/src/__tests__/matching-tier.test.ts
+@@ -0,0 +1,19 @@
++import { describe, it, expect } from "vitest";
++import { effectiveTier } from "../lib/matching-tier.js";
++
++describe("effectiveTier", () => {
++  it("forces SILVER for trial requests regardless of any subscription tier", () => {
++    expect(effectiveTier(true, "PLATINUM")).toBe("SILVER");
++    expect(effectiveTier(true, "GOLD")).toBe("SILVER");
++    expect(effectiveTier(true, undefined)).toBe("SILVER");
++  });
++
++  it("uses the real subscription tier for non-trial requests", () => {
++    expect(effectiveTier(false, "GOLD")).toBe("GOLD");
++    expect(effectiveTier(false, "PLATINUM")).toBe("PLATINUM");
++  });
++
++  it("defaults non-trial requests with no subscription to SILVER", () => {
++    expect(effectiveTier(false, undefined)).toBe("SILVER");
++  });
++});
+diff --git a/confide-backend/src/lib/matching-tier.ts b/confide-backend/src/lib/matching-tier.ts
+new file mode 100644
+index 0000000..04fb204
+--- /dev/null
++++ b/confide-backend/src/lib/matching-tier.ts
+@@ -0,0 +1,9 @@
++/**
++ * Pure matching-tier logic, split out from workers/matching.worker.ts so it
++ * can be unit-tested without importing that file — importing the worker
++ * module directly would open real Redis/BullMQ connections as a side
++ * effect of module load.
++ */
++export function effectiveTier(isTrial: boolean, subscriptionTier: string | undefined): string {
++  return isTrial ? "SILVER" : subscriptionTier ?? "SILVER";
++}
+diff --git a/confide-backend/src/lib/subscription.ts b/confide-backend/src/lib/subscription.ts
+new file mode 100644
+index 0000000..a1a8b1c
+--- /dev/null
++++ b/confide-backend/src/lib/subscription.ts
+@@ -0,0 +1,53 @@
++import { prisma } from "./prisma.js";
++
++/**
++ * Both roles require an active subscription per the product decision —
++ * Listeners are no longer a free volunteer pool, Speakers are no longer
++ * free either. The one carve-out is the one-time free trial (see
++ * routes/trial.ts), which bypasses this check entirely by creating its own
++ * MatchRequest with isTrial=true rather than going through the routes this
++ * guards.
++ *
++ * NOTE ON APP STORE POLICY: a hard paywall with zero free usage for BOTH
++ * sides of a two-sided marketplace is a real risk for app review rejection
++ * — reviewers generally expect to see some free value before a paywall.
++ * This was an explicit product decision, not something this code is
++ * silently deciding on your behalf; flagging again here since it's the
++ * enforcement point.
++ */
++export async function hasActiveSubscription(userId: string): Promise<boolean> {
++  const subscription = await prisma.subscription.findUnique({ where: { userId } });
++  if (!subscription) return false;
++
++  // Mirror whatever Stripe's webhook last wrote (see routes/billing.ts) —
++  // "active" and "trialing" are the two Stripe statuses that mean "the
++  // person should have access right now."
++  const activeStatuses = new Set(["active", "trialing"]);
++  if (!activeStatuses.has(subscription.status)) return false;
++
++  // Belt-and-suspenders: if renewsAt is in the past, don't trust the status
++  // string alone — a missed/delayed webhook shouldn't grant free access
++  // indefinitely.
++  if (subscription.renewsAt && subscription.renewsAt < new Date()) return false;
++
++  return true;
++}
++
++export async function getSubscriptionSummary(userId: string) {
++  const [subscription, user] = await Promise.all([
++    prisma.subscription.findUnique({ where: { userId } }),
++    prisma.user.findUnique({ where: { id: userId }, select: { freeTrialUsedAt: true } }),
++  ]);
++
++  const active = subscription
++    ? new Set(["active", "trialing"]).has(subscription.status) &&
++      (!subscription.renewsAt || subscription.renewsAt >= new Date())
++    : false;
++
++  return {
++    active,
++    tier: active ? subscription?.tier ?? null : null,
++    renewsAt: subscription?.renewsAt ?? null,
++    trialAvailable: !user?.freeTrialUsedAt,
++  };
++}
+diff --git a/confide-backend/src/routes/chat.ts b/confide-backend/src/routes/chat.ts
+index 241e325..bf6c073 100644
+--- a/confide-backend/src/routes/chat.ts
++++ b/confide-backend/src/routes/chat.ts
+@@ -16,15 +16,38 @@ const moderation = createModerationService();
+ const ESCALATION_RETENTION_DAYS = 30;
+ 
+ interface ChatClientMessage {
+-  type: "send";
+-  text: string;
++  type: "send" | "end";
++  text?: string;
+ }
+ 
+ type ChatServerMessage =
+   | { type: "matched" | "history"; [k: string]: unknown }
+   | { type: "message"; messageId: string; senderId: string; content: string; sentAt: string }
+   | { type: "blocked"; reason: "moderation"; appealHint: string }
+-  | { type: "crisis_resources"; resources: ReturnType<typeof getCrisisResources> };
++  | { type: "crisis_resources"; resources: ReturnType<typeof getCrisisResources> }
++  | { type: "trial_info"; trialEndsAt: string }
++  | { type: "conversation_ended"; reason: "manual" | "trial_expired" };
++
++/**
++ * Marks a conversation ENDED exactly once, even if called concurrently from
++ * both the manual-end path and the trial-expiry timer — the `updateMany`
++ * with `status: "ACTIVE"` in the where-clause means only the first caller's
++ * update actually changes anything; the loser sees count 0 and skips the
++ * publish, so both parties get exactly one conversation_ended event, not two.
++ */
++async function endConversationOnce(
++  conversationId: string,
++  channel: string,
++  reason: "manual" | "trial_expired",
++): Promise<void> {
++  const result = await prisma.conversation.updateMany({
++    where: { id: conversationId, status: "ACTIVE" },
++    data: { status: "ENDED", endedAt: new Date() },
++  });
++  if (result.count === 0) return; // already ended by the other path
++
++  await redisPub.publish(channel, JSON.stringify({ type: "conversation_ended", reason } satisfies ChatServerMessage));
++}
+ 
+ export async function registerChatRoutes(app: FastifyInstance) {
+   app.get("/ws/chat/:conversationId", { websocket: true }, async (socket: WebSocket, req) => {
+@@ -55,6 +78,26 @@ export async function registerChatRoutes(app: FastifyInstance) {
+ 
+     const channel = conversationChannel(conversationId);
+ 
++    // Trial conversations are hard-capped server-side, not just shown a
++    // client-side countdown — a modified client can't extend its own free
++    // trial by ignoring the timer.
++    let trialTimer: ReturnType<typeof setTimeout> | undefined;
++    if (conversation.isTrial && conversation.trialEndsAt) {
++      socket.send(
++        JSON.stringify({ type: "trial_info", trialEndsAt: conversation.trialEndsAt.toISOString() } satisfies ChatServerMessage),
++      );
++      const msRemaining = conversation.trialEndsAt.getTime() - Date.now();
++      if (msRemaining <= 0) {
++        await endConversationOnce(conversationId, channel, "trial_expired");
++      } else {
++        trialTimer = setTimeout(() => {
++          endConversationOnce(conversationId, channel, "trial_expired").catch((err) =>
++            req.log.error({ err }, "failed to auto-end expired trial conversation"),
++          );
++        }, msRemaining);
++      }
++    }
++
+     // Each connection gets its own filtered listener on the shared
+     // subscriber, per the stateless-gateway design in Section 3: any
+     // gateway instance can hold either side of the conversation, and
+@@ -63,11 +106,23 @@ export async function registerChatRoutes(app: FastifyInstance) {
+     const onRedisMessage = (chan: string, message: string) => {
+       if (chan !== channel) return;
+       socket.send(message);
++      // Once either party ends the conversation (manually or via trial
++      // expiry), close this socket too — there's nothing further to send
++      // or receive on an ended conversation.
++      try {
++        const parsed = JSON.parse(message);
++        if (parsed.type === "conversation_ended") {
++          socket.close(4000, "conversation_ended");
++        }
++      } catch {
++        // ignore parse failures — not every published message needs this check to succeed
++      }
+     };
+     redisSub.on("message", onRedisMessage);
+     await redisSub.subscribe(channel);
+ 
+     socket.on("close", () => {
++      if (trialTimer) clearTimeout(trialTimer);
+       redisSub.off("message", onRedisMessage);
+       // Note: in a multi-connection-per-channel deployment, only unsubscribe
+       // once the last local listener for this channel is gone. Fine for a
+@@ -83,6 +138,10 @@ export async function registerChatRoutes(app: FastifyInstance) {
+       } catch {
+         return; // ignore malformed frames
+       }
++      if (parsed.type === "end") {
++        await endConversationOnce(conversationId, channel, "manual");
++        return;
++      }
+       if (parsed.type !== "send" || typeof parsed.text !== "string" || parsed.text.length === 0) {
+         return;
+       }
+diff --git a/confide-backend/src/routes/journal.ts b/confide-backend/src/routes/journal.ts
+new file mode 100644
+index 0000000..e96655d
+--- /dev/null
++++ b/confide-backend/src/routes/journal.ts
+@@ -0,0 +1,77 @@
++import type { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "../lib/prisma.js";
++import { hasActiveSubscription } from "../lib/subscription.js";
++
++const createEntrySchema = z.object({
++  content: z.string().min(1).max(10_000),
++  mood: z.string().max(50).optional(),
++});
++
++const updateEntrySchema = z.object({
++  content: z.string().min(1).max(10_000).optional(),
++  mood: z.string().max(50).optional(),
++});
++
++/**
++ * Wellness feature, gated behind active subscription per the product
++ * decision — same gate as real matching (lib/subscription.ts). Entries are
++ * private: no sharing, no moderation pipeline, since this is reflective
++ * content rather than a conversation with another person.
++ */
++export async function registerJournalRoutes(app: FastifyInstance) {
++  app.post("/journal", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    const body = createEntrySchema.safeParse(req.body);
++    if (!body.success) return reply.code(400).send({ error: "invalid_body" });
++
++    const entry = await prisma.journalEntry.create({
++      data: { userId: req.user.sub, content: body.data.content, mood: body.data.mood },
++    });
++    return reply.code(201).send({ entry });
++  });
++
++  app.get("/journal", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    const entries = await prisma.journalEntry.findMany({
++      where: { userId: req.user.sub },
++      orderBy: { createdAt: "desc" },
++      take: 200,
++    });
++    return reply.send({ entries });
++  });
++
++  app.patch("/journal/:id", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    const { id } = req.params as { id: string };
++    const body = updateEntrySchema.safeParse(req.body);
++    if (!body.success) return reply.code(400).send({ error: "invalid_body" });
++
++    const existing = await prisma.journalEntry.findUnique({ where: { id } });
++    if (!existing || existing.userId !== req.user.sub) {
++      return reply.code(404).send({ error: "not_found" });
++    }
++
++    const entry = await prisma.journalEntry.update({ where: { id }, data: body.data });
++    return reply.send({ entry });
++  });
++
++  app.delete("/journal/:id", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    const { id } = req.params as { id: string };
++    const existing = await prisma.journalEntry.findUnique({ where: { id } });
++    if (!existing || existing.userId !== req.user.sub) {
++      return reply.code(404).send({ error: "not_found" });
++    }
++    await prisma.journalEntry.delete({ where: { id } });
++    return reply.code(204).send();
++  });
++}
+diff --git a/confide-backend/src/routes/match.ts b/confide-backend/src/routes/match.ts
+index 55dbef1..89dd4a7 100644
+--- a/confide-backend/src/routes/match.ts
++++ b/confide-backend/src/routes/match.ts
+@@ -4,6 +4,7 @@ import { prisma } from "../lib/prisma.js";
+ import { matchingQueue } from "../lib/queues.js";
+ import { config } from "../config.js";
+ import { getCrisisResources, isCrisisTopic } from "../lib/crisis.js";
++import { hasActiveSubscription } from "../lib/subscription.js";
+ 
+ const createMatchRequestSchema = z.object({
+   role: z.enum(["SPEAKER", "LISTENER"]),
+@@ -22,6 +23,13 @@ export async function registerMatchRoutes(app: FastifyInstance) {
+     }
+     const userId = req.user.sub;
+ 
++    // Product decision: BOTH roles require an active subscription for real
++    // (non-trial) matching. The one-time free trial goes through
++    // routes/trial.ts instead, which doesn't call this endpoint at all.
++    if (!(await hasActiveSubscription(userId))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++
+     // Hard exclusion (Section 1.1 / Section 9): these topics never enter the
+     // peer-matching pool, full stop — not a client-side filter, enforced
+     // here regardless of what a (possibly modified) client sends.
+diff --git a/confide-backend/src/routes/mood.ts b/confide-backend/src/routes/mood.ts
+new file mode 100644
+index 0000000..7ab818b
+--- /dev/null
++++ b/confide-backend/src/routes/mood.ts
+@@ -0,0 +1,38 @@
++import type { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "../lib/prisma.js";
++import { hasActiveSubscription } from "../lib/subscription.js";
++
++const createMoodSchema = z.object({
++  score: z.number().int().min(1).max(5),
++  note: z.string().max(500).optional(),
++});
++
++export async function registerMoodRoutes(app: FastifyInstance) {
++  app.post("/mood", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    const body = createMoodSchema.safeParse(req.body);
++    if (!body.success) return reply.code(400).send({ error: "invalid_body" });
++
++    const entry = await prisma.moodEntry.create({
++      data: { userId: req.user.sub, score: body.data.score, note: body.data.note },
++    });
++    return reply.code(201).send({ entry });
++  });
++
++  app.get("/mood", { onRequest: [app.authenticate] }, async (req, reply) => {
++    if (!(await hasActiveSubscription(req.user.sub))) {
++      return reply.code(402).send({ error: "subscription_required" });
++    }
++    // Most-recent-first, capped — this backs a simple trend view, not
++    // long-range analytics, so 200 entries is plenty for now.
++    const entries = await prisma.moodEntry.findMany({
++      where: { userId: req.user.sub },
++      orderBy: { createdAt: "desc" },
++      take: 200,
++    });
++    return reply.send({ entries });
++  });
++}
+diff --git a/confide-backend/src/routes/profile.ts b/confide-backend/src/routes/profile.ts
+index 9867468..fdb42c9 100644
+--- a/confide-backend/src/routes/profile.ts
++++ b/confide-backend/src/routes/profile.ts
+@@ -1,6 +1,7 @@
+ import type { FastifyInstance } from "fastify";
+ import { z } from "zod";
+ import { prisma } from "../lib/prisma.js";
++import { getSubscriptionSummary } from "../lib/subscription.js";
+ 
+ const updateMeSchema = z.object({
+   expoPushToken: z.string().optional(),
+@@ -46,4 +47,15 @@ export async function registerProfileRoutes(app: FastifyInstance) {
+ 
+     return reply.code(204).send();
+   });
++
++  // The mobile app's post-login navigation gate reads this to decide
++  // whether to land on the Home hub, the trial offer, or a subscribe-only
++  // screen. This is a convenience for the client — the REAL enforcement is
++  // server-side on each gated route (match.ts, journal.ts, mood.ts), not
++  // this endpoint, since a client can't be trusted to honor a gate it only
++  // read once.
++  app.get("/subscription/status", { onRequest: [app.authenticate] }, async (req, reply) => {
++    const summary = await getSubscriptionSummary(req.user.sub);
++    return reply.send(summary);
++  });
+ }
+diff --git a/confide-backend/src/routes/trial.ts b/confide-backend/src/routes/trial.ts
+new file mode 100644
+index 0000000..8ee98af
+--- /dev/null
++++ b/confide-backend/src/routes/trial.ts
+@@ -0,0 +1,46 @@
++import type { FastifyInstance } from "fastify";
++import { z } from "zod";
++import { prisma } from "../lib/prisma.js";
++import { matchingQueue } from "../lib/queues.js";
++
++const TRIAL_TOPIC_TAG = "general"; // trial skips topic selection entirely, per product decision
++const TRIAL_MATCH_REQUEST_TTL_SECONDS = 120;
++
++const startTrialSchema = z.object({
++  role: z.enum(["SPEAKER", "LISTENER"]),
++});
++
++export async function registerTrialRoutes(app: FastifyInstance) {
++  app.post("/trial/start", { onRequest: [app.authenticate] }, async (req, reply) => {
++    const body = startTrialSchema.safeParse(req.body);
++    if (!body.success) return reply.code(400).send({ error: "invalid_body" });
++
++    const userId = req.user.sub;
++    const user = await prisma.user.findUnique({ where: { id: userId } });
++    if (!user) return reply.code(404).send({ error: "not_found" });
++
++    if (user.freeTrialUsedAt) {
++      return reply.code(409).send({ error: "trial_already_used" });
++    }
++
++    // Mark the trial as used at REQUEST time, not at match/completion time —
++    // otherwise cancel-and-retry (or just never getting matched) would let
++    // someone queue an unlimited number of trial requests.
++    await prisma.user.update({ where: { id: userId }, data: { freeTrialUsedAt: new Date() } });
++
++    const expiresAt = new Date(Date.now() + TRIAL_MATCH_REQUEST_TTL_SECONDS * 1000);
++    const matchRequest = await prisma.matchRequest.create({
++      data: {
++        userId,
++        role: body.data.role,
++        topicTag: TRIAL_TOPIC_TAG,
++        isTrial: true,
++        expiresAt,
++      },
++    });
++
++    await matchingQueue.add("attempt-match", { matchRequestId: matchRequest.id }, { attempts: 1 });
++
++    return reply.code(201).send({ matchRequestId: matchRequest.id, expiresAt });
++  });
++}
+diff --git a/confide-backend/src/server.ts b/confide-backend/src/server.ts
+index 5796600..014dc32 100644
+--- a/confide-backend/src/server.ts
++++ b/confide-backend/src/server.ts
+@@ -12,6 +12,9 @@ import { registerBillingRoutes } from "./routes/billing.js";
+ import { registerProfileRoutes } from "./routes/profile.js";
+ import { registerAdminRoutes } from "./routes/admin.js";
+ import { registerAdminUiRoutes } from "./routes/adminUi.js";
++import { registerTrialRoutes } from "./routes/trial.js";
++import { registerJournalRoutes } from "./routes/journal.js";
++import { registerMoodRoutes } from "./routes/mood.js";
+ 
+ initSentry();
+ 
+@@ -69,6 +72,9 @@ async function main() {
+   await registerProfileRoutes(app);
+   await registerAdminRoutes(app);
+   await registerAdminUiRoutes(app);
++  await registerTrialRoutes(app);
++  await registerJournalRoutes(app);
++  await registerMoodRoutes(app);
+ 
+   await app.listen({ port: config.port, host: "0.0.0.0" });
+ }
+diff --git a/confide-backend/src/workers/matching.worker.ts b/confide-backend/src/workers/matching.worker.ts
+index 1025c14..83439cd 100644
+--- a/confide-backend/src/workers/matching.worker.ts
++++ b/confide-backend/src/workers/matching.worker.ts
+@@ -5,6 +5,7 @@ import { prisma } from "../lib/prisma.js";
+ import { matchingQueue, QUEUE_NAMES, type MatchingJobData } from "../lib/queues.js";
+ import { sendPushNotifications } from "../services/push.js";
+ import { haversineKm } from "../lib/geo.js";
++import { effectiveTier } from "../lib/matching-tier.js";
+ import { initSentry, Sentry } from "../lib/sentry.js";
+ 
+ initSentry();
+@@ -23,6 +24,7 @@ initSentry();
+  */
+ 
+ const RETRY_DELAY_MS = 3000;
++const TRIAL_DURATION_MS = 10 * 60 * 1000; // 10 minutes, per product decision
+ 
+ async function findCompatibleCounterpart(request: {
+   id: string;
+@@ -33,6 +35,7 @@ async function findCompatibleCounterpart(request: {
+   languagePref: string | null;
+   radiusMinKm: number | null;
+   radiusMaxKm: number | null;
++  isTrial: boolean;
+ }) {
+   const counterpartRole = request.role === "SPEAKER" ? "LISTENER" : "SPEAKER";
+ 
+@@ -40,7 +43,7 @@ async function findCompatibleCounterpart(request: {
+     where: { id: request.userId },
+     include: { subscription: true },
+   });
+-  const requestingTier = requestingUser?.subscription?.tier ?? "SILVER";
++  const requestingTier = effectiveTier(request.isTrial, requestingUser?.subscription?.tier);
+ 
+   const candidates = await prisma.matchRequest.findMany({
+     where: {
+@@ -55,7 +58,7 @@ async function findCompatibleCounterpart(request: {
+   });
+ 
+   for (const candidate of candidates) {
+-    const candidateTier = candidate.user.subscription?.tier ?? "SILVER";
++    const candidateTier = effectiveTier(candidate.isTrial, candidate.user.subscription?.tier);
+     if (candidateTier !== requestingTier) continue; // tier-locked pools (Section 1)
+ 
+     if (request.genderPref && request.genderPref !== "UNSPECIFIED" && candidate.user.gender !== request.genderPref) {
+@@ -127,11 +130,16 @@ const worker = new Worker<MatchingJobData>(
+         throw new Error("counterpart_no_longer_available");
+       }
+ 
++      const conversationIsTrial = request.isTrial || counterpart.isTrial;
++      const trialEndsAt = conversationIsTrial ? new Date(Date.now() + TRIAL_DURATION_MS) : null;
++
+       const conversation = await tx.conversation.create({
+         data: {
+           participantAId: speakerReq.userId,
+           participantBId: listenerReq.userId,
+           topicTag: request.topicTag,
++          isTrial: conversationIsTrial,
++          trialEndsAt,
+         },
+       });
+ 
+@@ -146,7 +154,12 @@ const worker = new Worker<MatchingJobData>(
+ 
+       await redisPub.publish(
+         conversationChannel(conversation.id),
+-        JSON.stringify({ type: "matched", conversationId: conversation.id }),
++        JSON.stringify({
++          type: "matched",
++          conversationId: conversation.id,
++          isTrial: conversationIsTrial,
++          trialEndsAt: trialEndsAt?.toISOString() ?? null,
++        }),
+       );
+ 
+       // Push notification for whichever side is backgrounded — the WS
+diff --git a/confide-mobile/README.md b/confide-mobile/README.md
+index de0d561..70c4ca3 100644
+--- a/confide-mobile/README.md
++++ b/confide-mobile/README.md
+@@ -64,6 +64,39 @@ swap in your machine's LAN IP, or better, wire up an env-based config
+   object genuinely has `.granted`, this is a type-resolution gap, not a
+   logic bug.
+ 
++## Notes on the newest additions (paywall, trial, wellness features)
++
++- **Navigation restructure**: `Welcome` is now the landing screen right
++  after OTP verification (not `RoleTopic`/`Home`). It checks
++  `GET /subscription/status` on every focus (not just mount — a screen
++  further down the stack getting popped back into view via `goBack()`
++  doesn't remount, so a plain `useEffect` would show stale state) and
++  forwards to `Home` if a subscription is active, or offers the trial/
++  subscribe choice if not.
++- **Topic selection is now a picker** (`components/TopicPickerModal.tsx`),
++  not free text — includes a clearly-labeled crisis option that still maps
++  to the exact tag the backend's hard crisis-exclusion checks for.
++- **Trial flow**: `TrialRoleSelectScreen` (Speak/Listen only, no topic) →
++  `MatchingScreen` (unchanged, works for trial and real requests alike) →
++  `ChatScreen` (now shows a live countdown banner, driven by a `trial_info`
++  WebSocket event). Ending a trial — automatically or manually — routes to
++  `TrialEndedScreen`, which previews locked features and offers Subscribe.
++- **BillingScreen** now re-checks subscription status when the app returns
++  to the foreground after the Stripe Checkout browser tab, with a few
++  retries (the webhook can lag slightly) and a manual "I've already
++  subscribed" fallback button — since there's no in-app way to know a
++  browser-based checkout completed otherwise.
++- **Meditation** (`MeditationScreen.tsx`): timer + calming visual only —
++  **no real audio is bundled**. I can't source or verify licensing for
++  meditation audio. To add real sound: install `expo-av` or `expo-audio`,
++  add royalty-free tracks under `assets/meditation/`, and wire playback to
++  the existing timer state.
++- **Journal** and **Mood tracker**: full CRUD against the new backend
++  routes, gated behind the subscription check server-side (a 402 here
++  would mean the paywall gate let someone through it shouldn't have).
++- **Breathing**: pure client-side animation (box breathing, 4-4-4-4), no
++  backend or audio dependency at all.
++
+ ## Explicitly not built here
+ 
+ - Group chat, dark/light theming beyond the one palette used here
+diff --git a/confide-mobile/src/api/client.ts b/confide-mobile/src/api/client.ts
+index 259dbe1..baa61db 100644
+--- a/confide-mobile/src/api/client.ts
++++ b/confide-mobile/src/api/client.ts
+@@ -138,4 +138,50 @@ export const api = {
+       token,
+       body: JSON.stringify({ tier }),
+     }),
++
++  getSubscriptionStatus: (token: string) =>
++    request<{
++      active: boolean;
++      tier: "SILVER" | "GOLD" | "DIAMOND" | "PLATINUM" | null;
++      renewsAt: string | null;
++      trialAvailable: boolean;
++    }>("/subscription/status", { token }),
++
++  startTrial: (token: string, role: MatchRole) =>
++    request<{ matchRequestId: string; expiresAt: string }>("/trial/start", {
++      method: "POST",
++      token,
++      body: JSON.stringify({ role }),
++    }),
++
++  createJournalEntry: (token: string, data: { content: string; mood?: string }) =>
++    request<{ entry: JournalEntry }>("/journal", { method: "POST", token, body: JSON.stringify(data) }),
++
++  getJournalEntries: (token: string) => request<{ entries: JournalEntry[] }>("/journal", { token }),
++
++  updateJournalEntry: (token: string, id: string, data: { content?: string; mood?: string }) =>
++    request<{ entry: JournalEntry }>(`/journal/${id}`, { method: "PATCH", token, body: JSON.stringify(data) }),
++
++  deleteJournalEntry: (token: string, id: string) =>
++    request<void>(`/journal/${id}`, { method: "DELETE", token }),
++
++  createMoodEntry: (token: string, data: { score: number; note?: string }) =>
++    request<{ entry: MoodEntry }>("/mood", { method: "POST", token, body: JSON.stringify(data) }),
++
++  getMoodEntries: (token: string) => request<{ entries: MoodEntry[] }>("/mood", { token }),
+ };
++
++export interface JournalEntry {
++  id: string;
++  content: string;
++  mood: string | null;
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface MoodEntry {
++  id: string;
++  score: number;
++  note: string | null;
++  createdAt: string;
++}
+diff --git a/confide-mobile/src/components/TopicPickerModal.tsx b/confide-mobile/src/components/TopicPickerModal.tsx
+new file mode 100644
+index 0000000..90ee7ef
+--- /dev/null
++++ b/confide-mobile/src/components/TopicPickerModal.tsx
+@@ -0,0 +1,92 @@
++import React from "react";
++import { Modal, View, Text, Pressable, FlatList, StyleSheet } from "react-native";
++
++/**
++ * Fixed topic list instead of free text — per product decision, users pick
++ * rather than type. The "self-harm" entry deliberately maps to the exact
++ * tag the backend's hard crisis-exclusion checks for (lib/crisis.ts on the
++ * backend) — selecting it still routes to crisis resources instead of
++ * matching, same as before this became a picker.
++ */
++export interface Topic {
++  tag: string;
++  label: string;
++  isCrisis?: boolean;
++}
++
++export const TOPICS: Topic[] = [
++  { tag: "work-stress", label: "Work & career stress" },
++  { tag: "breakup", label: "Breakup or relationship issues" },
++  { tag: "loneliness", label: "Loneliness" },
++  { tag: "family-conflict", label: "Family conflict" },
++  { tag: "anxiety", label: "Anxiety" },
++  { tag: "grief", label: "Grief & loss" },
++  { tag: "general", label: "Just want to talk" },
++  { tag: "self-harm", label: "Self-harm or suicidal thoughts", isCrisis: true },
++];
++
++interface Props {
++  visible: boolean;
++  selectedTag: string | null;
++  onSelect: (topic: Topic) => void;
++  onClose: () => void;
++}
++
++export default function TopicPickerModal({ visible, selectedTag, onSelect, onClose }: Props) {
++  return (
++    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
++      <Pressable style={styles.backdrop} onPress={onClose}>
++        <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation()}>
++          <Text style={styles.title}>What would you like to talk about?</Text>
++          <FlatList
++            data={TOPICS}
++            keyExtractor={(t) => t.tag}
++            renderItem={({ item }) => (
++              <Pressable
++                style={[
++                  styles.row,
++                  selectedTag === item.tag && styles.rowActive,
++                  item.isCrisis && styles.rowCrisis,
++                ]}
++                onPress={() => {
++                  onSelect(item);
++                  onClose();
++                }}
++              >
++                <Text style={[styles.rowText, item.isCrisis && styles.rowCrisisText]}>{item.label}</Text>
++              </Pressable>
++            )}
++          />
++          <Pressable style={styles.cancelButton} onPress={onClose}>
++            <Text style={styles.cancelText}>Cancel</Text>
++          </Pressable>
++        </Pressable>
++      </Pressable>
++    </Modal>
++  );
++}
++
++const styles = StyleSheet.create({
++  backdrop: { flex: 1, backgroundColor: "rgba(0,0,0,0.5)", justifyContent: "flex-end" },
++  sheet: {
++    backgroundColor: "#1c1830",
++    borderTopLeftRadius: 20,
++    borderTopRightRadius: 20,
++    padding: 20,
++    maxHeight: "75%",
++  },
++  title: { color: "#fff", fontSize: 17, fontWeight: "700", marginBottom: 12 },
++  row: {
++    paddingVertical: 14,
++    paddingHorizontal: 14,
++    borderRadius: 10,
++    marginBottom: 6,
++    backgroundColor: "#221e33",
++  },
++  rowActive: { backgroundColor: "#7c5cff" },
++  rowCrisis: { backgroundColor: "#2e1f26", borderWidth: 1, borderColor: "#e5484d" },
++  rowText: { color: "#fff", fontSize: 15 },
++  rowCrisisText: { color: "#ff9b9e" },
++  cancelButton: { alignItems: "center", paddingVertical: 14, marginTop: 4 },
++  cancelText: { color: "#a39cb5", fontSize: 14 },
++});
+diff --git a/confide-mobile/src/navigation/RootNavigator.tsx b/confide-mobile/src/navigation/RootNavigator.tsx
+index 69f3d80..d0471a6 100644
+--- a/confide-mobile/src/navigation/RootNavigator.tsx
++++ b/confide-mobile/src/navigation/RootNavigator.tsx
+@@ -8,6 +8,10 @@ import type { CrisisResource } from "@/api/client";
+ 
+ import SignupScreen from "@/screens/SignupScreen";
+ import VerifyOtpScreen from "@/screens/VerifyOtpScreen";
++import WelcomeScreen from "@/screens/WelcomeScreen";
++import TrialRoleSelectScreen from "@/screens/TrialRoleSelectScreen";
++import TrialEndedScreen from "@/screens/TrialEndedScreen";
++import HomeScreen from "@/screens/HomeScreen";
+ import RoleTopicScreen from "@/screens/RoleTopicScreen";
+ import MatchingScreen from "@/screens/MatchingScreen";
+ import ChatScreen from "@/screens/ChatScreen";
+@@ -16,6 +20,10 @@ import CrisisResourcesScreen from "@/screens/CrisisResourcesScreen";
+ import BillingScreen from "@/screens/BillingScreen";
+ import ListenerProfileScreen from "@/screens/ListenerProfileScreen";
+ import SettingsScreen from "@/screens/SettingsScreen";
++import MeditationScreen from "@/screens/MeditationScreen";
++import JournalScreen from "@/screens/JournalScreen";
++import MoodTrackerScreen from "@/screens/MoodTrackerScreen";
++import BreathingScreen from "@/screens/BreathingScreen";
+ 
+ Notifications.setNotificationHandler({
+   handleNotification: async () => ({
+@@ -30,14 +38,22 @@ Notifications.setNotificationHandler({
+ export type RootStackParamList = {
+   Signup: undefined;
+   VerifyOtp: { phoneE164: string };
++  Welcome: undefined;
++  TrialRoleSelect: undefined;
++  TrialEnded: undefined;
++  Home: undefined;
+   RoleTopic: undefined;
+   Matching: { matchRequestId: string };
+   Chat: { conversationId: string };
+-  RateConversation: { conversationId: string };
++  RateConversation: { conversationId: string; isTrial?: boolean };
+   CrisisResources: { resources: CrisisResource[] };
+   Billing: undefined;
+   ListenerProfile: undefined;
+   Settings: undefined;
++  Meditation: undefined;
++  Journal: undefined;
++  MoodTracker: undefined;
++  Breathing: undefined;
+ };
+ 
+ const Stack = createNativeStackNavigator<RootStackParamList>();
+@@ -58,6 +74,22 @@ export default function RootNavigator() {
+           </>
+         ) : (
+           <>
++            {/* Welcome is the landing screen post-auth — it checks
++                subscription status itself and either forwards to Home
++                (active subscription) or offers the free trial / subscribe
++                paywall. See screens/WelcomeScreen.tsx. */}
++            <Stack.Screen name="Welcome" component={WelcomeScreen} options={{ title: "Confide" }} />
++            <Stack.Screen
++              name="TrialRoleSelect"
++              component={TrialRoleSelectScreen}
++              options={{ title: "Free trial" }}
++            />
++            <Stack.Screen
++              name="TrialEnded"
++              component={TrialEndedScreen}
++              options={{ title: "Trial complete", headerBackVisible: false }}
++            />
++            <Stack.Screen name="Home" component={HomeScreen} options={{ title: "Confide" }} />
+             <Stack.Screen name="RoleTopic" component={RoleTopicScreen} options={{ title: "Talk" }} />
+             <Stack.Screen name="Matching" component={MatchingScreen} options={{ title: "Finding a match…" }} />
+             <Stack.Screen name="Chat" component={ChatScreen} options={{ title: "Chat" }} />
+@@ -78,6 +110,10 @@ export default function RootNavigator() {
+               options={{ title: "Your listener stats" }}
+             />
+             <Stack.Screen name="Settings" component={SettingsScreen} options={{ title: "Settings" }} />
++            <Stack.Screen name="Meditation" component={MeditationScreen} options={{ title: "Meditation" }} />
++            <Stack.Screen name="Journal" component={JournalScreen} options={{ title: "Journal" }} />
++            <Stack.Screen name="MoodTracker" component={MoodTrackerScreen} options={{ title: "Mood tracker" }} />
++            <Stack.Screen name="Breathing" component={BreathingScreen} options={{ title: "Breathing" }} />
+           </>
+         )}
+       </Stack.Navigator>
+diff --git a/confide-mobile/src/screens/BillingScreen.tsx b/confide-mobile/src/screens/BillingScreen.tsx
+index b9c1bce..c1eeb66 100644
+--- a/confide-mobile/src/screens/BillingScreen.tsx
++++ b/confide-mobile/src/screens/BillingScreen.tsx
+@@ -1,5 +1,5 @@
+-import React, { useState } from "react";
+-import { View, Text, Pressable, StyleSheet, Linking, Alert } from "react-native";
++import React, { useEffect, useRef, useState } from "react";
++import { View, Text, Pressable, StyleSheet, Linking, Alert, AppState, ActivityIndicator } from "react-native";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+ import type { RootStackParamList } from "@/navigation/RootNavigator";
+ import { api } from "@/api/client";
+@@ -24,12 +24,52 @@ const TIERS = [
+ export default function BillingScreen({ navigation }: Props) {
+   const { token } = useAuth();
+   const [loadingTier, setLoadingTier] = useState<string | null>(null);
++  const [checkingStatus, setCheckingStatus] = useState(false);
++  const wentToBrowserRef = useRef(false);
++
++  // The webhook that actually activates a subscription (routes/billing.ts
++  // on the backend) fires after Stripe redirects back, which happens
++  // outside this app entirely — so the only reliable signal we have here
++  // is "did the app just come back to the foreground after we sent someone
++  // to the browser." Re-check on that transition, with a couple of
++  // retries since the webhook can lag the browser redirect slightly.
++  useEffect(() => {
++    const sub = AppState.addEventListener("change", (state) => {
++      if (state === "active" && wentToBrowserRef.current && token) {
++        wentToBrowserRef.current = false;
++        checkStatusWithRetries();
++      }
++    });
++    return () => sub.remove();
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [token]);
++
++  const checkStatusWithRetries = async (attemptsLeft = 3) => {
++    if (!token) return;
++    setCheckingStatus(true);
++    try {
++      const status = await api.getSubscriptionStatus(token);
++      if (status.active) {
++        navigation.replace("Home");
++        return;
++      }
++      if (attemptsLeft > 0) {
++        setTimeout(() => checkStatusWithRetries(attemptsLeft - 1), 2000);
++        return;
++      }
++    } catch {
++      // ignore — manual "I've subscribed" button below covers this
++    } finally {
++      setCheckingStatus(false);
++    }
++  };
+ 
+   const onChoose = async (tier: (typeof TIERS)[number]["id"]) => {
+     if (!token) return;
+     setLoadingTier(tier);
+     try {
+       const { checkoutUrl } = await api.createCheckoutSession(token, tier);
++      wentToBrowserRef.current = true;
+       await Linking.openURL(checkoutUrl);
+     } catch {
+       Alert.alert("Couldn't start checkout", "Please try again in a moment.");
+@@ -43,6 +83,13 @@ export default function BillingScreen({ navigation }: Props) {
+       <Text style={styles.title}>Choose your tier</Text>
+       <Text style={styles.hint}>Opens Stripe Checkout in your browser.</Text>
+ 
++      {checkingStatus && (
++        <View style={styles.checkingBanner}>
++          <ActivityIndicator color="#7c5cff" size="small" />
++          <Text style={styles.checkingText}>Checking your subscription…</Text>
++        </View>
++      )}
++
+       {TIERS.map((tier) => (
+         <Pressable
+           key={tier.id}
+@@ -56,6 +103,10 @@ export default function BillingScreen({ navigation }: Props) {
+         </Pressable>
+       ))}
+ 
++      <Pressable onPress={() => checkStatusWithRetries()} style={styles.refreshButton}>
++        <Text style={styles.refreshButtonText}>I've already subscribed — refresh</Text>
++      </Pressable>
++
+       <Pressable onPress={() => navigation.goBack()} style={styles.back}>
+         <Text style={styles.backText}>Back</Text>
+       </Pressable>
+@@ -71,6 +122,10 @@ const styles = StyleSheet.create({
+   cardTitle: { color: "#fff", fontWeight: "700", fontSize: 16 },
+   cardBlurb: { color: "#a39cb5", fontSize: 13 },
+   loading: { color: "#7c5cff", fontSize: 12, marginTop: 4 },
+-  back: { alignItems: "center", marginTop: 16 },
++  checkingBanner: { flexDirection: "row", alignItems: "center", gap: 8, backgroundColor: "#2e2647", borderRadius: 10, padding: 10, marginBottom: 4 },
++  checkingText: { color: "#c9b8ff", fontSize: 12, fontWeight: "600" },
++  refreshButton: { alignItems: "center", paddingVertical: 12, marginTop: 8 },
++  refreshButtonText: { color: "#7c5cff", fontSize: 13, fontWeight: "600" },
++  back: { alignItems: "center", marginTop: 4 },
+   backText: { color: "#a39cb5", fontSize: 14 },
+ });
+diff --git a/confide-mobile/src/screens/BreathingScreen.tsx b/confide-mobile/src/screens/BreathingScreen.tsx
+new file mode 100644
+index 0000000..2ba860c
+--- /dev/null
++++ b/confide-mobile/src/screens/BreathingScreen.tsx
+@@ -0,0 +1,86 @@
++import React, { useEffect, useRef, useState } from "react";
++import { View, Text, Pressable, StyleSheet, Animated, Easing } from "react-native";
++
++/**
++ * Box breathing (4-4-4-4): inhale 4s, hold 4s, exhale 4s, hold 4s, repeat.
++ * Purely client-side animation — no backend, no audio dependency.
++ */
++type Phase = "inhale" | "hold1" | "exhale" | "hold2";
++
++const PHASES: Array<{ phase: Phase; label: string; durationMs: number; targetScale: number }> = [
++  { phase: "inhale", label: "Breathe in", durationMs: 4000, targetScale: 1.4 },
++  { phase: "hold1", label: "Hold", durationMs: 4000, targetScale: 1.4 },
++  { phase: "exhale", label: "Breathe out", durationMs: 4000, targetScale: 0.85 },
++  { phase: "hold2", label: "Hold", durationMs: 4000, targetScale: 0.85 },
++];
++
++export default function BreathingScreen() {
++  const [running, setRunning] = useState(false);
++  const [phaseIndex, setPhaseIndex] = useState(0);
++  const scale = useRef(new Animated.Value(0.85)).current;
++  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++
++  useEffect(() => {
++    return () => {
++      if (timeoutRef.current) clearTimeout(timeoutRef.current);
++    };
++  }, []);
++
++  const runPhase = (index: number) => {
++    const step = PHASES[index % PHASES.length];
++    setPhaseIndex(index % PHASES.length);
++    Animated.timing(scale, {
++      toValue: step.targetScale,
++      duration: step.durationMs,
++      easing: Easing.inOut(Easing.ease),
++      useNativeDriver: true,
++    }).start();
++    timeoutRef.current = setTimeout(() => runPhase(index + 1), step.durationMs);
++  };
++
++  const start = () => {
++    setRunning(true);
++    runPhase(0);
++  };
++
++  const stop = () => {
++    setRunning(false);
++    if (timeoutRef.current) clearTimeout(timeoutRef.current);
++    scale.stopAnimation();
++    Animated.timing(scale, { toValue: 0.85, duration: 400, useNativeDriver: true }).start();
++  };
++
++  return (
++    <View style={styles.container}>
++      <Text style={styles.title}>Breathing exercise</Text>
++      <Text style={styles.subtitle}>4 seconds in, hold, 4 seconds out, hold — repeat.</Text>
++
++      <View style={styles.circleWrap}>
++        <Animated.View style={[styles.circle, { transform: [{ scale }] }]} />
++        {running && <Text style={styles.phaseLabel}>{PHASES[phaseIndex].label}</Text>}
++      </View>
++
++      <Pressable style={styles.button} onPress={running ? stop : start}>
++        <Text style={styles.buttonText}>{running ? "Stop" : "Start"}</Text>
++      </Pressable>
++    </View>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flex: 1, backgroundColor: "#151220", padding: 24, alignItems: "center", justifyContent: "center", gap: 16 },
++  title: { color: "#fff", fontSize: 22, fontWeight: "700" },
++  subtitle: { color: "#a39cb5", fontSize: 14, textAlign: "center", marginBottom: 24 },
++  circleWrap: { width: 220, height: 220, alignItems: "center", justifyContent: "center", marginBottom: 24 },
++  circle: {
++    position: "absolute",
++    width: 140,
++    height: 140,
++    borderRadius: 70,
++    backgroundColor: "#7c5cff",
++    opacity: 0.85,
++  },
++  phaseLabel: { color: "#fff", fontSize: 16, fontWeight: "700" },
++  button: { backgroundColor: "#221e33", borderRadius: 12, paddingVertical: 14, paddingHorizontal: 40 },
++  buttonText: { color: "#fff", fontWeight: "700", fontSize: 16 },
++});
+diff --git a/confide-mobile/src/screens/ChatScreen.tsx b/confide-mobile/src/screens/ChatScreen.tsx
+index 7bb924a..0cf7453 100644
+--- a/confide-mobile/src/screens/ChatScreen.tsx
++++ b/confide-mobile/src/screens/ChatScreen.tsx
+@@ -16,10 +16,19 @@ interface ChatMessage {
+ }
+ 
+ type ServerEvent =
+-  | { type: "matched"; conversationId: string }
++  | { type: "matched"; conversationId: string; isTrial?: boolean; trialEndsAt?: string | null }
+   | { type: "message"; messageId: string; senderId: string; content: string; sentAt: string }
+   | { type: "blocked"; reason: string; appealHint: string }
+-  | { type: "crisis_resources"; resources: CrisisResource[] };
++  | { type: "crisis_resources"; resources: CrisisResource[] }
++  | { type: "trial_info"; trialEndsAt: string }
++  | { type: "conversation_ended"; reason: "manual" | "trial_expired" };
++
++function formatCountdown(msRemaining: number): string {
++  const totalSeconds = Math.max(0, Math.floor(msRemaining / 1000));
++  const m = Math.floor(totalSeconds / 60);
++  const s = totalSeconds % 60;
++  return `${m}:${String(s).padStart(2, "0")}`;
++}
+ 
+ export default function ChatScreen({ route, navigation }: Props) {
+   const { conversationId } = route.params;
+@@ -27,8 +36,25 @@ export default function ChatScreen({ route, navigation }: Props) {
+   const [messages, setMessages] = useState<ChatMessage[]>([]);
+   const [draft, setDraft] = useState("");
+   const [connected, setConnected] = useState(false);
++  const [trialEndsAt, setTrialEndsAt] = useState<Date | null>(null);
++  const [countdownLabel, setCountdownLabel] = useState<string | null>(null);
+   const wsRef = useRef<WebSocket | null>(null);
+   const myUserIdRef = useRef<string | null>(null);
++  const isTrialRef = useRef(false);
++
++  // Client-side ticking display only — the actual 10-minute cap is enforced
++  // server-side (see the backend's routes/chat.ts trial timer), so there's
++  // nothing to "cheat" by messing with this.
++  useEffect(() => {
++    if (!trialEndsAt) {
++      setCountdownLabel(null);
++      return;
++    }
++    const tick = () => setCountdownLabel(formatCountdown(trialEndsAt.getTime() - Date.now()));
++    tick();
++    const interval = setInterval(tick, 1000);
++    return () => clearInterval(interval);
++  }, [trialEndsAt]);
+ 
+   useLayoutEffect(() => {
+     navigation.setOptions({
+@@ -78,6 +104,15 @@ export default function ChatScreen({ route, navigation }: Props) {
+         // Section 9.1: surface resources without ending the conversation or
+         // treating the sender as if they've done something wrong.
+         navigation.navigate("CrisisResources", { resources: data.resources });
++      } else if (data.type === "trial_info") {
++        isTrialRef.current = true;
++        setTrialEndsAt(new Date(data.trialEndsAt));
++      } else if (data.type === "conversation_ended") {
++        if (data.reason === "trial_expired") {
++          navigation.replace("TrialEnded");
++        } else {
++          navigation.replace("RateConversation", { conversationId, isTrial: isTrialRef.current });
++        }
+       }
+     };
+ 
+@@ -92,13 +127,27 @@ export default function ChatScreen({ route, navigation }: Props) {
+ 
+   const onOpenMenu = () => {
+     Alert.alert("Conversation options", undefined, [
+-      { text: "End & rate", onPress: () => navigation.replace("RateConversation", { conversationId }) },
++      { text: "End & rate", onPress: onEndConversation },
+       { text: "Report", onPress: onReport },
+       { text: "Block", onPress: onBlock, style: "destructive" },
+       { text: "Cancel", style: "cancel" },
+     ]);
+   };
+ 
++  const onEndConversation = () => {
++    // Tell the server so the other party's socket also gets a
++    // conversation_ended event and closes cleanly — navigating away locally
++    // without this would leave the other person's chat open with no idea
++    // the conversation is over.
++    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
++      wsRef.current.send(JSON.stringify({ type: "end" }));
++    }
++    // The server's conversation_ended broadcast (handled above) will
++    // navigate us onward — but navigate immediately too in case the socket
++    // is already gone, so the button never feels unresponsive.
++    navigation.replace("RateConversation", { conversationId, isTrial: isTrialRef.current });
++  };
++
+   const onReport = () => {
+     // In a full build this opens a reason picker; simplified to one flow here.
+     Alert.alert("Report this conversation?", undefined, [
+@@ -125,12 +174,21 @@ export default function ChatScreen({ route, navigation }: Props) {
+     const otherUserId = messages.find((m) => !m.mine)?.senderId;
+     if (!otherUserId) return;
+     await api.block(token, otherUserId).catch(() => {});
+-    navigation.replace("RoleTopic");
++    if (isTrialRef.current) {
++      navigation.reset({ index: 0, routes: [{ name: "TrialEnded" }] });
++    } else {
++      navigation.reset({ index: 0, routes: [{ name: "Home" }] });
++    }
+   };
+ 
+   return (
+     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === "ios" ? "padding" : undefined}>
+       {!connected && <Text style={styles.connecting}>Connecting…</Text>}
++      {countdownLabel && (
++        <View style={styles.trialBanner}>
++          <Text style={styles.trialBannerText}>Free trial · {countdownLabel} remaining</Text>
++        </View>
++      )}
+       <FlatList
+         data={messages}
+         keyExtractor={(m) => m.id}
+@@ -161,6 +219,8 @@ export default function ChatScreen({ route, navigation }: Props) {
+ const styles = StyleSheet.create({
+   container: { flex: 1, backgroundColor: "#151220" },
+   connecting: { color: "#a39cb5", textAlign: "center", padding: 6, fontSize: 12 },
++  trialBanner: { backgroundColor: "#2e2647", paddingVertical: 8, alignItems: "center" },
++  trialBannerText: { color: "#c9b8ff", fontSize: 12, fontWeight: "600" },
+   messageList: { padding: 16, gap: 8 },
+   bubble: { maxWidth: "78%", borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10 },
+   bubbleMine: { backgroundColor: "#7c5cff", alignSelf: "flex-end" },
+diff --git a/confide-mobile/src/screens/CrisisResourcesScreen.tsx b/confide-mobile/src/screens/CrisisResourcesScreen.tsx
+index 9cee72f..379a74a 100644
+--- a/confide-mobile/src/screens/CrisisResourcesScreen.tsx
++++ b/confide-mobile/src/screens/CrisisResourcesScreen.tsx
+@@ -5,10 +5,17 @@ import type { RootStackParamList } from "@/navigation/RootNavigator";
+ 
+ type Props = NativeStackScreenProps<RootStackParamList, "CrisisResources">;
+ 
+-// Reached either from RoleTopicScreen (crisis topic chosen up front) or from
+-// ChatScreen (crisis content flagged mid-conversation). Either way, this is
+-// meant to be supportive, not a dead end — the person can always go back to
+-// the app afterward (see Section 9.1: don't freeze people out).
++// Reached either from RoleTopicScreen (crisis topic chosen up front), from
++// TrialRoleSelectScreen's matching flow, or from ChatScreen (crisis content
++// flagged mid-conversation — including during a free trial). Either way,
++// this is meant to be supportive, not a dead end — the person can always go
++// back to the app afterward (see Section 9.1: don't freeze people out).
++//
++// Navigates back to Welcome rather than straight to RoleTopic: RoleTopic
++// now sits behind the subscription gate, and a trial user hitting this
++// screen mid-trial doesn't have a subscription yet. Welcome re-checks
++// status itself and forwards to Home if one exists, so this is correct for
++// both subscribed and not-yet-subscribed people.
+ export default function CrisisResourcesScreen({ route, navigation }: Props) {
+   const { resources } = route.params;
+ 
+@@ -37,7 +44,7 @@ export default function CrisisResourcesScreen({ route, navigation }: Props) {
+         </View>
+       ))}
+ 
+-      <Pressable style={styles.button} onPress={() => navigation.navigate("RoleTopic")}>
++      <Pressable style={styles.button} onPress={() => navigation.navigate("Welcome")}>
+         <Text style={styles.buttonText}>Back to Confide</Text>
+       </Pressable>
+     </View>
+diff --git a/confide-mobile/src/screens/HomeScreen.tsx b/confide-mobile/src/screens/HomeScreen.tsx
+new file mode 100644
+index 0000000..103a3ea
+--- /dev/null
++++ b/confide-mobile/src/screens/HomeScreen.tsx
+@@ -0,0 +1,68 @@
++import React from "react";
++import { View, Text, Pressable, StyleSheet, ScrollView } from "react-native";
++import type { NativeStackScreenProps } from "@react-navigation/native-stack";
++import type { RootStackParamList } from "@/navigation/RootNavigator";
++
++type Props = NativeStackScreenProps<RootStackParamList, "Home">;
++
++interface FeatureTile {
++  title: string;
++  description: string;
++  route: keyof RootStackParamList;
++}
++
++const FEATURES: FeatureTile[] = [
++  { title: "Talk", description: "Speak with someone, or listen", route: "RoleTopic" },
++  { title: "Meditate", description: "Guided timers for calm and focus", route: "Meditation" },
++  { title: "Journal", description: "Write down what's on your mind", route: "Journal" },
++  { title: "Mood tracker", description: "Log how you're feeling over time", route: "MoodTracker" },
++  { title: "Breathing", description: "A simple guided breathing exercise", route: "Breathing" },
++];
++
++export default function HomeScreen({ navigation }: Props) {
++  return (
++    <ScrollView contentContainerStyle={styles.container}>
++      <Text style={styles.title}>Confide</Text>
++      <Text style={styles.subtitle}>What would you like to do today?</Text>
++
++      {FEATURES.map((f) => (
++        <Pressable key={f.route} style={styles.tile} onPress={() => navigation.navigate(f.route as never)}>
++          <Text style={styles.tileTitle}>{f.title}</Text>
++          <Text style={styles.tileDescription}>{f.description}</Text>
++        </Pressable>
++      ))}
++
++      <View style={styles.secondaryRow}>
++        <Pressable onPress={() => navigation.navigate("ListenerProfile")} style={styles.secondaryButton}>
++          <Text style={styles.secondaryButtonText}>Your stats</Text>
++        </Pressable>
++        <Pressable onPress={() => navigation.navigate("Billing")} style={styles.secondaryButton}>
++          <Text style={styles.secondaryButtonText}>Manage subscription</Text>
++        </Pressable>
++      </View>
++
++      <Pressable onPress={() => navigation.navigate("Settings")} style={styles.settingsLink}>
++        <Text style={styles.settingsLinkText}>Settings</Text>
++      </Pressable>
++    </ScrollView>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flexGrow: 1, backgroundColor: "#151220", padding: 24, gap: 12 },
++  title: { color: "#fff", fontSize: 26, fontWeight: "700", marginTop: 12 },
++  subtitle: { color: "#a39cb5", fontSize: 14, marginBottom: 12 },
++  tile: {
++    backgroundColor: "#221e33",
++    borderRadius: 14,
++    padding: 18,
++    marginBottom: 4,
++  },
++  tileTitle: { color: "#fff", fontSize: 17, fontWeight: "700" },
++  tileDescription: { color: "#a39cb5", fontSize: 13, marginTop: 4 },
++  secondaryRow: { flexDirection: "row", gap: 10, marginTop: 16 },
++  secondaryButton: { flex: 1, alignItems: "center", paddingVertical: 12, backgroundColor: "#1c1830", borderRadius: 10 },
++  secondaryButtonText: { color: "#a39cb5", fontSize: 13, fontWeight: "600" },
++  settingsLink: { alignItems: "center", marginTop: 20 },
++  settingsLinkText: { color: "#6b6580", fontSize: 13 },
++});
+diff --git a/confide-mobile/src/screens/JournalScreen.tsx b/confide-mobile/src/screens/JournalScreen.tsx
+new file mode 100644
+index 0000000..c43da1a
+--- /dev/null
++++ b/confide-mobile/src/screens/JournalScreen.tsx
+@@ -0,0 +1,133 @@
++import React, { useCallback, useEffect, useState } from "react";
++import {
++  View,
++  Text,
++  TextInput,
++  Pressable,
++  FlatList,
++  StyleSheet,
++  Alert,
++  ActivityIndicator,
++  KeyboardAvoidingView,
++  Platform,
++} from "react-native";
++import { useFocusEffect } from "@react-navigation/native";
++import { api, type JournalEntry } from "@/api/client";
++import { useAuth } from "@/context/AuthContext";
++
++export default function JournalScreen() {
++  const { token } = useAuth();
++  const [entries, setEntries] = useState<JournalEntry[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [draft, setDraft] = useState("");
++  const [saving, setSaving] = useState(false);
++
++  const load = useCallback(async () => {
++    if (!token) return;
++    try {
++      const { entries: fetched } = await api.getJournalEntries(token);
++      setEntries(fetched);
++    } catch {
++      // gated behind an active subscription server-side — a 402 here means
++      // the paywall gate above this screen let someone through it shouldn't
++      // have, which would be a bug elsewhere, not something to paper over.
++      Alert.alert("Couldn't load your journal", "Please try again.");
++    } finally {
++      setLoading(false);
++    }
++  }, [token]);
++
++  useFocusEffect(
++    useCallback(() => {
++      load();
++    }, [load]),
++  );
++
++  const onSave = async () => {
++    if (!token || !draft.trim()) return;
++    setSaving(true);
++    try {
++      await api.createJournalEntry(token, { content: draft.trim() });
++      setDraft("");
++      await load();
++    } catch {
++      Alert.alert("Couldn't save", "Please try again.");
++    } finally {
++      setSaving(false);
++    }
++  };
++
++  const onDelete = (id: string) => {
++    if (!token) return;
++    Alert.alert("Delete this entry?", undefined, [
++      { text: "Cancel", style: "cancel" },
++      {
++        text: "Delete",
++        style: "destructive",
++        onPress: async () => {
++          await api.deleteJournalEntry(token, id).catch(() => {});
++          load();
++        },
++      },
++    ]);
++  };
++
++  return (
++    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : "height"}>
++      <View style={styles.container}>
++        <Text style={styles.title}>Journal</Text>
++
++        <TextInput
++          style={styles.input}
++          placeholder="What's on your mind?"
++          placeholderTextColor="#8a8598"
++          value={draft}
++          onChangeText={setDraft}
++          multiline
++        />
++        <Pressable style={styles.saveButton} onPress={onSave} disabled={saving || !draft.trim()}>
++          <Text style={styles.saveButtonText}>{saving ? "Saving…" : "Save entry"}</Text>
++        </Pressable>
++
++        {loading ? (
++          <ActivityIndicator color="#7c5cff" style={{ marginTop: 24 }} />
++        ) : (
++          <FlatList
++            data={entries}
++            keyExtractor={(e) => e.id}
++            contentContainerStyle={{ paddingTop: 16, paddingBottom: 40 }}
++            ListEmptyComponent={<Text style={styles.emptyText}>No entries yet — write your first one above.</Text>}
++            renderItem={({ item }) => (
++              <Pressable style={styles.entry} onLongPress={() => onDelete(item.id)}>
++                <Text style={styles.entryDate}>{new Date(item.createdAt).toLocaleString()}</Text>
++                <Text style={styles.entryContent}>{item.content}</Text>
++              </Pressable>
++            )}
++          />
++        )}
++      </View>
++    </KeyboardAvoidingView>
++  );
++}
++
++const styles = StyleSheet.create({
++  flex: { flex: 1, backgroundColor: "#151220" },
++  container: { flex: 1, padding: 24 },
++  title: { color: "#fff", fontSize: 22, fontWeight: "700", marginBottom: 12 },
++  input: {
++    backgroundColor: "#221e33",
++    color: "#fff",
++    borderRadius: 10,
++    paddingHorizontal: 14,
++    paddingVertical: 12,
++    fontSize: 15,
++    minHeight: 90,
++    textAlignVertical: "top",
++  },
++  saveButton: { backgroundColor: "#7c5cff", borderRadius: 10, paddingVertical: 12, alignItems: "center", marginTop: 8 },
++  saveButtonText: { color: "#fff", fontWeight: "600" },
++  emptyText: { color: "#6b6580", textAlign: "center", marginTop: 24 },
++  entry: { backgroundColor: "#221e33", borderRadius: 10, padding: 14, marginBottom: 8 },
++  entryDate: { color: "#6b6580", fontSize: 11, marginBottom: 4 },
++  entryContent: { color: "#fff", fontSize: 14 },
++});
+diff --git a/confide-mobile/src/screens/MeditationScreen.tsx b/confide-mobile/src/screens/MeditationScreen.tsx
+new file mode 100644
+index 0000000..5de1232
+--- /dev/null
++++ b/confide-mobile/src/screens/MeditationScreen.tsx
+@@ -0,0 +1,121 @@
++import React, { useEffect, useRef, useState } from "react";
++import { View, Text, Pressable, StyleSheet, Vibration } from "react-native";
++
++/**
++ * No real audio is bundled here — I can't source or verify licensing for
++ * meditation audio, and generating audio content is out of scope for this
++ * build. This is a timer + calming visual + a vibration cue at the end.
++ *
++ * To add real audio: install `expo-av` (or the newer `expo-audio`), drop
++ * royalty-free tracks under `assets/meditation/`, and play/pause them
++ * alongside the timer state below (`isRunning`). Everything else — session
++ * list, countdown, completion handling — stays the same.
++ */
++interface Session {
++  id: string;
++  title: string;
++  description: string;
++  durationSeconds: number;
++}
++
++const SESSIONS: Session[] = [
++  { id: "focus-3", title: "Focus reset", description: "A quick reset between conversations", durationSeconds: 3 * 60 },
++  { id: "calm-5", title: "Calm breathing", description: "Settle a racing mind", durationSeconds: 5 * 60 },
++  { id: "wind-down-10", title: "Sleep wind-down", description: "Ease into rest", durationSeconds: 10 * 60 },
++];
++
++function formatTime(totalSeconds: number): string {
++  const m = Math.floor(totalSeconds / 60);
++  const s = totalSeconds % 60;
++  return `${m}:${String(s).padStart(2, "0")}`;
++}
++
++export default function MeditationScreen() {
++  const [session, setSession] = useState<Session | null>(null);
++  const [remaining, setRemaining] = useState(0);
++  const [isRunning, setIsRunning] = useState(false);
++  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
++
++  useEffect(() => {
++    return () => {
++      if (intervalRef.current) clearInterval(intervalRef.current);
++    };
++  }, []);
++
++  const start = (s: Session) => {
++    setSession(s);
++    setRemaining(s.durationSeconds);
++    setIsRunning(true);
++    if (intervalRef.current) clearInterval(intervalRef.current);
++    intervalRef.current = setInterval(() => {
++      setRemaining((prev) => {
++        if (prev <= 1) {
++          if (intervalRef.current) clearInterval(intervalRef.current);
++          setIsRunning(false);
++          Vibration.vibrate(400);
++          return 0;
++        }
++        return prev - 1;
++      });
++    }, 1000);
++  };
++
++  const stop = () => {
++    if (intervalRef.current) clearInterval(intervalRef.current);
++    setIsRunning(false);
++    setSession(null);
++  };
++
++  if (session) {
++    return (
++      <View style={styles.container}>
++        <View style={styles.circle}>
++          <Text style={styles.timerText}>{formatTime(remaining)}</Text>
++        </View>
++        <Text style={styles.sessionTitle}>{session.title}</Text>
++        <Pressable style={styles.stopButton} onPress={stop}>
++          <Text style={styles.stopButtonText}>{remaining === 0 ? "Done" : "End early"}</Text>
++        </Pressable>
++      </View>
++    );
++  }
++
++  return (
++    <View style={styles.container}>
++      <Text style={styles.title}>Meditation</Text>
++      <Text style={styles.subtitle}>Pick a length that fits right now.</Text>
++      {SESSIONS.map((s) => (
++        <Pressable key={s.id} style={styles.sessionTile} onPress={() => start(s)}>
++          <Text style={styles.sessionTileTitle}>{s.title}</Text>
++          <Text style={styles.sessionTileDescription}>
++            {s.description} · {Math.round(s.durationSeconds / 60)} min
++          </Text>
++        </Pressable>
++      ))}
++    </View>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flex: 1, backgroundColor: "#151220", padding: 24, gap: 10, justifyContent: "center" },
++  title: { color: "#fff", fontSize: 22, fontWeight: "700" },
++  subtitle: { color: "#a39cb5", fontSize: 14, marginBottom: 12 },
++  sessionTile: { backgroundColor: "#221e33", borderRadius: 12, padding: 16, marginBottom: 4 },
++  sessionTileTitle: { color: "#fff", fontSize: 16, fontWeight: "700" },
++  sessionTileDescription: { color: "#a39cb5", fontSize: 13, marginTop: 2 },
++  circle: {
++    width: 220,
++    height: 220,
++    borderRadius: 110,
++    borderWidth: 4,
++    borderColor: "#7c5cff",
++    alignItems: "center",
++    justifyContent: "center",
++    alignSelf: "center",
++    marginBottom: 24,
++  },
++  timerText: { color: "#fff", fontSize: 40, fontWeight: "700" },
++  sessionTitle: { color: "#fff", fontSize: 18, fontWeight: "600", textAlign: "center" },
++  stopButton: { alignItems: "center", marginTop: 24, paddingVertical: 14 },
++  stopButtonText: { color: "#a39cb5", fontSize: 15 },
++});
+diff --git a/confide-mobile/src/screens/MoodTrackerScreen.tsx b/confide-mobile/src/screens/MoodTrackerScreen.tsx
+new file mode 100644
+index 0000000..a8dcd28
+--- /dev/null
++++ b/confide-mobile/src/screens/MoodTrackerScreen.tsx
+@@ -0,0 +1,104 @@
++import React, { useCallback, useState } from "react";
++import { View, Text, Pressable, FlatList, StyleSheet, Alert, ActivityIndicator } from "react-native";
++import { useFocusEffect } from "@react-navigation/native";
++import { api, type MoodEntry } from "@/api/client";
++import { useAuth } from "@/context/AuthContext";
++
++const MOOD_SCALE: Array<{ score: number; emoji: string; label: string }> = [
++  { score: 1, emoji: "😞", label: "Very low" },
++  { score: 2, emoji: "😕", label: "Low" },
++  { score: 3, emoji: "😐", label: "Okay" },
++  { score: 4, emoji: "🙂", label: "Good" },
++  { score: 5, emoji: "😄", label: "Very good" },
++];
++
++export default function MoodTrackerScreen() {
++  const { token } = useAuth();
++  const [entries, setEntries] = useState<MoodEntry[]>([]);
++  const [loading, setLoading] = useState(true);
++  const [logging, setLogging] = useState(false);
++
++  const load = useCallback(async () => {
++    if (!token) return;
++    try {
++      const { entries: fetched } = await api.getMoodEntries(token);
++      setEntries(fetched);
++    } catch {
++      Alert.alert("Couldn't load your mood history", "Please try again.");
++    } finally {
++      setLoading(false);
++    }
++  }, [token]);
++
++  useFocusEffect(
++    useCallback(() => {
++      load();
++    }, [load]),
++  );
++
++  const onLog = async (score: number) => {
++    if (!token) return;
++    setLogging(true);
++    try {
++      await api.createMoodEntry(token, { score });
++      await load();
++    } catch {
++      Alert.alert("Couldn't save", "Please try again.");
++    } finally {
++      setLogging(false);
++    }
++  };
++
++  return (
++    <View style={styles.container}>
++      <Text style={styles.title}>How are you feeling right now?</Text>
++      <View style={styles.scaleRow}>
++        {MOOD_SCALE.map((m) => (
++          <Pressable key={m.score} style={styles.moodButton} onPress={() => onLog(m.score)} disabled={logging}>
++            <Text style={styles.moodEmoji}>{m.emoji}</Text>
++            <Text style={styles.moodLabel}>{m.label}</Text>
++          </Pressable>
++        ))}
++      </View>
++
++      <Text style={styles.historyTitle}>Recent history</Text>
++      {loading ? (
++        <ActivityIndicator color="#7c5cff" style={{ marginTop: 16 }} />
++      ) : (
++        <FlatList
++          data={entries}
++          keyExtractor={(e) => e.id}
++          ListEmptyComponent={<Text style={styles.emptyText}>No entries yet.</Text>}
++          renderItem={({ item }) => {
++            const mood = MOOD_SCALE.find((m) => m.score === item.score);
++            return (
++              <View style={styles.historyRow}>
++                <Text style={styles.historyEmoji}>{mood?.emoji ?? "•"}</Text>
++                <View style={styles.historyBarTrack}>
++                  <View style={[styles.historyBarFill, { width: `${(item.score / 5) * 100}%` }]} />
++                </View>
++                <Text style={styles.historyDate}>{new Date(item.createdAt).toLocaleDateString()}</Text>
++              </View>
++            );
++          }}
++        />
++      )}
++    </View>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flex: 1, backgroundColor: "#151220", padding: 24 },
++  title: { color: "#fff", fontSize: 18, fontWeight: "700", marginBottom: 16 },
++  scaleRow: { flexDirection: "row", justifyContent: "space-between", marginBottom: 28 },
++  moodButton: { alignItems: "center", flex: 1 },
++  moodEmoji: { fontSize: 32 },
++  moodLabel: { color: "#a39cb5", fontSize: 10, marginTop: 4, textAlign: "center" },
++  historyTitle: { color: "#a39cb5", fontSize: 13, marginBottom: 8, fontWeight: "600" },
++  emptyText: { color: "#6b6580", textAlign: "center", marginTop: 16 },
++  historyRow: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 10 },
++  historyEmoji: { fontSize: 18, width: 28 },
++  historyBarTrack: { flex: 1, height: 8, backgroundColor: "#221e33", borderRadius: 4, overflow: "hidden" },
++  historyBarFill: { height: 8, backgroundColor: "#7c5cff", borderRadius: 4 },
++  historyDate: { color: "#6b6580", fontSize: 11, width: 70, textAlign: "right" },
++});
+diff --git a/confide-mobile/src/screens/RateConversationScreen.tsx b/confide-mobile/src/screens/RateConversationScreen.tsx
+index 1446584..76749ec 100644
+--- a/confide-mobile/src/screens/RateConversationScreen.tsx
++++ b/confide-mobile/src/screens/RateConversationScreen.tsx
+@@ -8,12 +8,26 @@ import { useAuth } from "@/context/AuthContext";
+ type Props = NativeStackScreenProps<RootStackParamList, "RateConversation">;
+ 
+ export default function RateConversationScreen({ route, navigation }: Props) {
+-  const { conversationId } = route.params;
++  const { conversationId, isTrial } = route.params;
+   const { token } = useAuth();
+   const [score, setScore] = useState<number | null>(null);
+   const [comment, setComment] = useState("");
+   const [submitting, setSubmitting] = useState(false);
+ 
++  // A trial conversation ended manually (not just auto-expired) still leads
++  // to the locked-features/subscribe screen, per the product decision —
++  // "on ending their free trial automatically or of their own [choosing],
++  // they can see other features but aren't able to access them." A regular
++  // (non-trial) conversation returns to Home, not RoleTopic — RoleTopic is
++  // a sub-screen reached via Home's "Talk" tile now, not a landing point.
++  const onDone = () => {
++    if (isTrial) {
++      navigation.reset({ index: 0, routes: [{ name: "TrialEnded" }] });
++    } else {
++      navigation.reset({ index: 0, routes: [{ name: "Home" }] });
++    }
++  };
++
+   const onSubmit = async () => {
+     if (!token || !score) return;
+     setSubmitting(true);
+@@ -21,12 +35,12 @@ export default function RateConversationScreen({ route, navigation }: Props) {
+       await api.rate(token, { conversationId, score, comment: comment || undefined });
+     } finally {
+       setSubmitting(false);
+-      navigation.reset({ index: 0, routes: [{ name: "RoleTopic" }] });
++      onDone();
+     }
+   };
+ 
+   const onSkip = () => {
+-    navigation.reset({ index: 0, routes: [{ name: "RoleTopic" }] });
++    onDone();
+   };
+ 
+   return (
+diff --git a/confide-mobile/src/screens/RoleTopicScreen.tsx b/confide-mobile/src/screens/RoleTopicScreen.tsx
+index 7359ba6..58a8e7d 100644
+--- a/confide-mobile/src/screens/RoleTopicScreen.tsx
++++ b/confide-mobile/src/screens/RoleTopicScreen.tsx
+@@ -1,9 +1,10 @@
+ import React, { useState } from "react";
+-import { View, Text, TextInput, Pressable, StyleSheet, Alert } from "react-native";
++import { View, Text, Pressable, StyleSheet, Alert } from "react-native";
+ import type { NativeStackScreenProps } from "@react-navigation/native-stack";
+ import type { RootStackParamList } from "@/navigation/RootNavigator";
+ import { api, type Gender, type MatchRole } from "@/api/client";
+ import { useAuth } from "@/context/AuthContext";
++import TopicPickerModal, { type Topic } from "@/components/TopicPickerModal";
+ 
+ type Props = NativeStackScreenProps<RootStackParamList, "RoleTopic">;
+ 
+@@ -12,13 +13,14 @@ const GENDERS: Gender[] = ["UNSPECIFIED", "MALE", "FEMALE", "NON_BINARY"];
+ export default function RoleTopicScreen({ navigation }: Props) {
+   const { token } = useAuth();
+   const [role, setRole] = useState<MatchRole>("SPEAKER");
+-  const [topicTag, setTopicTag] = useState("");
++  const [topic, setTopic] = useState<Topic | null>(null);
++  const [pickerVisible, setPickerVisible] = useState(false);
+   const [genderPref, setGenderPref] = useState<Gender>("UNSPECIFIED");
+   const [submitting, setSubmitting] = useState(false);
+ 
+   const onFindMatch = async () => {
+     if (!token) return;
+-    if (!topicTag.trim()) {
++    if (!topic) {
+       Alert.alert("Pick a topic", "What do you want to talk about?");
+       return;
+     }
+@@ -26,7 +28,7 @@ export default function RoleTopicScreen({ navigation }: Props) {
+     try {
+       const result = await api.createMatchRequest(token, {
+         role,
+-        topicTag: topicTag.trim(),
++        topicTag: topic.tag,
+         genderPref: genderPref === "UNSPECIFIED" ? undefined : genderPref,
+       });
+ 
+@@ -38,8 +40,12 @@ export default function RoleTopicScreen({ navigation }: Props) {
+       }
+ 
+       navigation.navigate("Matching", { matchRequestId: result.matchRequestId });
+-    } catch {
+-      Alert.alert("Couldn't start matching", "Please try again in a moment.");
++    } catch (err: any) {
++      if (err?.status === 402) {
++        Alert.alert("Subscription required", "Your subscription isn't active. Head to Billing to subscribe.");
++      } else {
++        Alert.alert("Couldn't start matching", "Please try again in a moment.");
++      }
+     } finally {
+       setSubmitting(false);
+     }
+@@ -63,13 +69,16 @@ export default function RoleTopicScreen({ navigation }: Props) {
+         ))}
+       </View>
+ 
+-      <TextInput
+-        style={styles.input}
+-        placeholder="Topic (e.g. work-stress, breakup, loneliness)"
+-        placeholderTextColor="#8a8598"
+-        value={topicTag}
+-        onChangeText={setTopicTag}
+-        autoCapitalize="none"
++      <Pressable style={styles.topicButton} onPress={() => setPickerVisible(true)}>
++        <Text style={topic ? styles.topicButtonTextSelected : styles.topicButtonTextPlaceholder}>
++          {topic ? topic.label : "Choose a topic"}
++        </Text>
++      </Pressable>
++      <TopicPickerModal
++        visible={pickerVisible}
++        selectedTag={topic?.tag ?? null}
++        onSelect={setTopic}
++        onClose={() => setPickerVisible(false)}
+       />
+ 
+       <Text style={styles.label}>Preferred listener/speaker gender (optional)</Text>
+@@ -90,19 +99,6 @@ export default function RoleTopicScreen({ navigation }: Props) {
+       <Pressable style={styles.button} onPress={onFindMatch} disabled={submitting}>
+         <Text style={styles.buttonText}>{submitting ? "Starting…" : "Find a match"}</Text>
+       </Pressable>
+-
+-      <View style={styles.secondaryRow}>
+-        <Pressable onPress={() => navigation.navigate("ListenerProfile")} style={styles.secondaryButton}>
+-          <Text style={styles.secondaryButtonText}>Your stats</Text>
+-        </Pressable>
+-        <Pressable onPress={() => navigation.navigate("Billing")} style={styles.secondaryButton}>
+-          <Text style={styles.secondaryButtonText}>Upgrade tier</Text>
+-        </Pressable>
+-      </View>
+-
+-      <Pressable onPress={() => navigation.navigate("Settings")} style={styles.signOut}>
+-        <Text style={styles.signOutText}>Settings</Text>
+-      </Pressable>
+     </View>
+   );
+ }
+@@ -121,14 +117,14 @@ const styles = StyleSheet.create({
+   roleButtonActive: { backgroundColor: "#7c5cff" },
+   roleButtonText: { color: "#a39cb5", fontWeight: "600" },
+   roleButtonTextActive: { color: "#fff" },
+-  input: {
++  topicButton: {
+     backgroundColor: "#221e33",
+-    color: "#fff",
+     borderRadius: 10,
+     paddingHorizontal: 14,
+-    paddingVertical: 12,
+-    fontSize: 16,
++    paddingVertical: 14,
+   },
++  topicButtonTextPlaceholder: { color: "#8a8598", fontSize: 16 },
++  topicButtonTextSelected: { color: "#fff", fontSize: 16 },
+   label: { color: "#a39cb5", fontSize: 13, marginTop: 4 },
+   genderRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+   genderChip: {
+@@ -148,9 +144,4 @@ const styles = StyleSheet.create({
+     marginTop: 16,
+   },
+   buttonText: { color: "#fff", fontWeight: "600", fontSize: 16 },
+-  signOut: { alignItems: "center", marginTop: 20 },
+-  signOutText: { color: "#6b6580", fontSize: 13 },
+-  secondaryRow: { flexDirection: "row", gap: 10, marginTop: 12 },
+-  secondaryButton: { flex: 1, alignItems: "center", paddingVertical: 10, backgroundColor: "#1c1830", borderRadius: 10 },
+-  secondaryButtonText: { color: "#a39cb5", fontSize: 13, fontWeight: "600" },
+ });
+diff --git a/confide-mobile/src/screens/TrialEndedScreen.tsx b/confide-mobile/src/screens/TrialEndedScreen.tsx
+new file mode 100644
+index 0000000..6cfa044
+--- /dev/null
++++ b/confide-mobile/src/screens/TrialEndedScreen.tsx
+@@ -0,0 +1,63 @@
++import React from "react";
++import { View, Text, Pressable, StyleSheet, ScrollView } from "react-native";
++import type { NativeStackScreenProps } from "@react-navigation/native-stack";
++import type { RootStackParamList } from "@/navigation/RootNavigator";
++
++type Props = NativeStackScreenProps<RootStackParamList, "TrialEnded">;
++
++const LOCKED_FEATURES = [
++  { title: "Unlimited conversations", description: "Talk or listen as much as you'd like" },
++  { title: "Meditate", description: "Guided timers for calm and focus" },
++  { title: "Journal", description: "A private space to write down what's on your mind" },
++  { title: "Mood tracker", description: "See how you're feeling over time" },
++  { title: "Breathing", description: "A simple guided breathing exercise" },
++];
++
++export default function TrialEndedScreen({ navigation }: Props) {
++  return (
++    <ScrollView contentContainerStyle={styles.container}>
++      <Text style={styles.title}>That's a wrap on your free trial</Text>
++      <Text style={styles.subtitle}>Hope that was helpful. Here's what's waiting for you with a subscription:</Text>
++
++      {LOCKED_FEATURES.map((f) => (
++        <View key={f.title} style={styles.tile}>
++          <Text style={styles.lockIcon}>🔒</Text>
++          <View style={styles.tileTextWrap}>
++            <Text style={styles.tileTitle}>{f.title}</Text>
++            <Text style={styles.tileDescription}>{f.description}</Text>
++          </View>
++        </View>
++      ))}
++
++      <Pressable style={styles.subscribeButton} onPress={() => navigation.navigate("Billing")}>
++        <Text style={styles.subscribeButtonText}>Subscribe now</Text>
++      </Pressable>
++      <Pressable style={styles.laterButton} onPress={() => navigation.replace("Welcome")}>
++        <Text style={styles.laterButtonText}>Maybe later</Text>
++      </Pressable>
++    </ScrollView>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flexGrow: 1, backgroundColor: "#151220", padding: 24, gap: 10 },
++  title: { color: "#fff", fontSize: 22, fontWeight: "700", marginTop: 12 },
++  subtitle: { color: "#a39cb5", fontSize: 14, marginBottom: 12 },
++  tile: {
++    flexDirection: "row",
++    alignItems: "center",
++    backgroundColor: "#221e33",
++    borderRadius: 12,
++    padding: 14,
++    marginBottom: 4,
++    opacity: 0.8,
++  },
++  lockIcon: { fontSize: 18, marginRight: 12 },
++  tileTextWrap: { flex: 1 },
++  tileTitle: { color: "#fff", fontSize: 15, fontWeight: "700" },
++  tileDescription: { color: "#a39cb5", fontSize: 13, marginTop: 2 },
++  subscribeButton: { backgroundColor: "#7c5cff", borderRadius: 12, paddingVertical: 16, alignItems: "center", marginTop: 20 },
++  subscribeButtonText: { color: "#fff", fontWeight: "700", fontSize: 16 },
++  laterButton: { alignItems: "center", paddingVertical: 14 },
++  laterButtonText: { color: "#a39cb5", fontSize: 14 },
++});
+diff --git a/confide-mobile/src/screens/TrialRoleSelectScreen.tsx b/confide-mobile/src/screens/TrialRoleSelectScreen.tsx
+new file mode 100644
+index 0000000..0c0baff
+--- /dev/null
++++ b/confide-mobile/src/screens/TrialRoleSelectScreen.tsx
+@@ -0,0 +1,65 @@
++import React, { useState } from "react";
++import { View, Text, Pressable, StyleSheet, Alert } from "react-native";
++import type { NativeStackScreenProps } from "@react-navigation/native-stack";
++import type { RootStackParamList } from "@/navigation/RootNavigator";
++import { api, type MatchRole } from "@/api/client";
++import { useAuth } from "@/context/AuthContext";
++
++type Props = NativeStackScreenProps<RootStackParamList, "TrialRoleSelect">;
++
++/**
++ * Per the product decision, the trial skips topic selection entirely —
++ * picking Speak or Listen here goes straight into matching on a fixed
++ * "general" topic, capped at 10 minutes server-side (see the backend's
++ * routes/trial.ts and routes/chat.ts).
++ */
++export default function TrialRoleSelectScreen({ navigation }: Props) {
++  const { token } = useAuth();
++  const [submitting, setSubmitting] = useState<MatchRole | null>(null);
++
++  const onSelect = async (role: MatchRole) => {
++    if (!token) return;
++    setSubmitting(role);
++    try {
++      const result = await api.startTrial(token, role);
++      navigation.replace("Matching", { matchRequestId: result.matchRequestId });
++    } catch (err: any) {
++      if (err?.status === 409) {
++        Alert.alert("Trial already used", "You've already used your one-time free trial.");
++        navigation.replace("Welcome");
++      } else {
++        Alert.alert("Couldn't start trial", "Please try again in a moment.");
++      }
++    } finally {
++      setSubmitting(null);
++    }
++  };
++
++  return (
++    <View style={styles.container}>
++      <Text style={styles.title}>Free 10-minute trial</Text>
++      <Text style={styles.subtitle}>Pick one — you'll be matched right away.</Text>
++
++      <Pressable style={styles.button} onPress={() => onSelect("SPEAKER")} disabled={submitting !== null}>
++        <Text style={styles.buttonText}>{submitting === "SPEAKER" ? "Finding a match…" : "I want to talk"}</Text>
++      </Pressable>
++      <Pressable style={styles.button} onPress={() => onSelect("LISTENER")} disabled={submitting !== null}>
++        <Text style={styles.buttonText}>{submitting === "LISTENER" ? "Finding a match…" : "I want to listen"}</Text>
++      </Pressable>
++    </View>
++  );
++}
++
++const styles = StyleSheet.create({
++  container: { flex: 1, backgroundColor: "#151220", padding: 24, justifyContent: "center", gap: 12 },
++  title: { color: "#fff", fontSize: 22, fontWeight: "700" },
++  subtitle: { color: "#a39cb5", fontSize: 14, marginBottom: 16 },
++  button: {
++    backgroundColor: "#221e33",
++    borderRadius: 12,
++    paddingVertical: 18,
++    alignItems: "center",
++    marginBottom: 4,
++  },
++  buttonText: { color: "#fff", fontWeight: "700", fontSize: 16 },
++});
+diff --git a/confide-mobile/src/screens/WelcomeScreen.tsx b/confide-mobile/src/screens/WelcomeScreen.tsx
+new file mode 100644
+index 0000000..decaff4
+--- /dev/null
++++ b/confide-mobile/src/screens/WelcomeScreen.tsx
+@@ -0,0 +1,117 @@
++import React, { useCallback, useState } from "react";
++import { View, Text, Pressable, StyleSheet, ScrollView, ActivityIndicator } from "react-native";
++import type { NativeStackScreenProps } from "@react-navigation/native-stack";
++import { useFocusEffect } from "@react-navigation/native";
++import type { RootStackParamList } from "@/navigation/RootNavigator";
++import { api } from "@/api/client";
++import { useAuth } from "@/context/AuthContext";
++
++type Props = NativeStackScreenProps<RootStackParamList, "Welcome">;
++
++/**
++ * Landing screen right after OTP verification, and also wherever the app
++ * discovers a subscription isn't active (e.g. after a trial ends). Per the
++ * product decision, this is a hard gate: nothing past this screen is
++ * reachable without either starting the one-time free trial or subscribing.
++ *
++ * FLAGGING AGAIN (see prior conversation): a zero-free-usage paywall in
++ * front of BOTH sides of a two-sided marketplace is a real App Store /
++ * Play Store review risk. This screen implements the product decision as
++ * given, not a recommendation.
++ */
++const FEATURE_OVERVIEW = [
++  { title: "Talk", description: "Get matched with someone to speak with, or volunteer to listen" },
++  { title: "Meditate", description: "Guided timers for calm and focus" },
++  { title: "Journal", description: "A private space to write down what's on your mind" },
++  { title: "Mood tracker", description: "See how you're feeling over time" },
++  { title: "Breathing", description: "A simple guided breathing exercise for anxious moments" },
++];
++
++export default function WelcomeScreen({ navigation }: Props) {
++  const { token } = useAuth();
++  const [loading, setLoading] = useState(true);
++  const [trialAvailable, setTrialAvailable] = useState(false);
++
++  // useFocusEffect, not useEffect: this screen stays mounted underneath
++  // Billing in the stack, so navigation.goBack() from Billing wouldn't
++  // remount it — without this, returning from a completed Stripe checkout
++  // would show stale "not subscribed" state until a full app restart.
++  useFocusEffect(
++    useCallback(() => {
++      if (!token) return;
++      setLoading(true);
++      api
++        .getSubscriptionStatus(token)
++        .then((status) => {
++          if (status.active) {
++            navigation.replace("Home");
++            return;
++          }
++          setTrialAvailable(status.trialAvailable);
++        })
++        .catch(() => {})
++        .finally(() => setLoading(false));
++    }, [token, navigation]),
++  );
++
++  if (loading) {
++    return (
++      <View style={styles.loadingContainer}>
++        <ActivityIndicator color="#7c5cff" />
++      </View>
++    );
++  }
++
++  return (
++    <ScrollView contentContainerStyle={styles.container}>
++      <Text style={styles.title}>Welcome to Confide</Text>
++      <Text style={styles.subtitle}>Here's everything included with a subscription:</Text>
++
++      {FEATURE_OVERVIEW.map((f) => (
++        <View key={f.title} style={styles.tile}>
++          <Text style={styles.tileTitle}>{f.title}</Text>
++          <Text style={styles.tileDescription}>{f.description}</Text>
++        </View>
++      ))}
++
++      {trialAvailable && (
++        <Pressable style={styles.trialButton} onPress={() => navigation.navigate("TrialRoleSelect")}>
++          <Text style={styles.trialButtonTitle}>Start your free 10-minute trial</Text>
++          <Text style={styles.trialButtonSubtitle}>One conversation, on us — no subscription needed yet</Text>
++        </Pressable>
++      )}
++
++      <Pressable style={styles.subscribeButton} onPress={() => navigation.navigate("Billing")}>
++        <Text style={styles.subscribeButtonText}>
++          {trialAvailable ? "Subscribe now instead" : "Subscribe to continue"}
++        </Text>
++      </Pressable>
++
++      {!trialAvailable && (
++        <Text style={styles.usedHint}>You've already used your free trial — subscribe to keep going.</Text>
++      )}
++    </ScrollView>
++  );
++}
++
++const styles = StyleSheet.create({
++  loadingContainer: { flex: 1, backgroundColor: "#151220", alignItems: "center", justifyContent: "center" },
++  container: { flexGrow: 1, backgroundColor: "#151220", padding: 24, gap: 10 },
++  title: { color: "#fff", fontSize: 24, fontWeight: "700", marginTop: 12 },
++  subtitle: { color: "#a39cb5", fontSize: 14, marginBottom: 8 },
++  tile: { backgroundColor: "#221e33", borderRadius: 12, padding: 14, marginBottom: 4 },
++  tileTitle: { color: "#fff", fontSize: 15, fontWeight: "700" },
++  tileDescription: { color: "#a39cb5", fontSize: 13, marginTop: 2 },
++  trialButton: { backgroundColor: "#7c5cff", borderRadius: 12, padding: 18, marginTop: 20 },
++  trialButtonTitle: { color: "#fff", fontSize: 16, fontWeight: "700" },
++  trialButtonSubtitle: { color: "#e4dcff", fontSize: 12, marginTop: 4 },
++  subscribeButton: {
++    backgroundColor: "#221e33",
++    borderRadius: 12,
++    paddingVertical: 16,
++    alignItems: "center",
++    marginTop: 12,
++  },
++  subscribeButtonText: { color: "#fff", fontWeight: "600", fontSize: 15 },
++  usedHint: { color: "#6b6580", fontSize: 12, textAlign: "center", marginTop: 8 },
++});
